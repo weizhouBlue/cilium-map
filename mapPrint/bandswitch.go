@@ -4,11 +4,11 @@ import (
 	"fmt"
 	"os"
 	"github.com/cilium/cilium/pkg/bpf"
-    mapMetrics "github.com/cilium/cilium/pkg/maps/metricsmap"
+        mapType "github.com/cilium/cilium/pkg/maps/bwmap"
 )
 
 
-func ParseMetric( path string  ){
+func ParseBandswitch( path string  ){
 
 	m, err := bpf.OpenMap(path)
 	if err != nil {
@@ -16,13 +16,13 @@ func ParseMetric( path string  ){
 		os.Exit(1)
 	}
 
-    m.MapKey=&mapMetrics.Key{}
-    m.MapValue=&mapMetrics.Value{}
-    m.DumpParser = bpf.ConvertKeyValue
+        m.MapKey=&mapType.EdtId{}
+        m.MapValue=&mapType.EdtInfo{}
+        m.DumpParser = bpf.ConvertKeyValue
 
 	parse := func(key bpf.MapKey, value bpf.MapValue) {
-		k := key.(*mapMetrics.Key)
-		v := value.(*mapMetrics.Value)
+		k := key.(*mapType.EdtId)
+		v := value.(*mapType.EdtInfo)
                 fmt.Printf("key: %+v \n", *k)
                 fmt.Printf("value: %+v\n",*v)
                 fmt.Printf("\n")

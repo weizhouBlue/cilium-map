@@ -6,18 +6,66 @@ import (
 	"github.com/urfave/cli"
 	"bpf-map/mapPrint"
 	"strings"
+        "path/filepath"
 )
 
 type mapInfo struct {
 	name string
+        mathPrefix string
 	handler func(string)
 }
 
 var GloablInfo = []mapInfo {
 	mapInfo{ 
 		name:"metrics" ,
+                mathPrefix: "cilium_metrics",
 		handler: mapPrint.ParseMetric ,
 	} ,
+        mapInfo{
+                name:"bandswitch" ,
+                mathPrefix: "cilium_throttle",
+                handler: mapPrint.ParseBandswitch ,
+        } ,
+        mapInfo{
+                name:"ct4" ,
+                mathPrefix: "cilium_ct4_",
+                handler: mapPrint.ParseCt4 ,
+        } ,
+        mapInfo{
+                name:"ct6" ,
+                mathPrefix: "cilium_ct6_",
+                handler: mapPrint.ParseCt6 ,
+        } ,
+        mapInfo{
+                name:"ct4_gloabl" ,
+                mathPrefix: "cilium_ct4_global",
+                handler: mapPrint.ParseCt4Global ,
+        } ,
+        mapInfo{
+                name:"ct6_gloabl" ,
+                mathPrefix: "cilium_ct6_global",
+                handler: mapPrint.ParseCt6Global ,
+        } ,
+        mapInfo{
+                name:"ct4" ,
+                mathPrefix: "cilium_ct_any4_",
+                handler: mapPrint.ParseCt4 ,
+        } ,
+        mapInfo{
+                name:"ct6" ,
+                mathPrefix: "cilium_ct_any6_",
+                handler: mapPrint.ParseCt6 ,
+        } ,
+        mapInfo{
+                name:"ct4_global" ,
+                mathPrefix: "cilium_ct_any4_global",
+                handler: mapPrint.ParseCt4Global ,
+        } ,
+        mapInfo{
+                name:"ct6_global" ,
+                mathPrefix: "cilium_ct_any6_global",
+                handler: mapPrint.ParseCt6Global ,
+        } ,
 }
 
 var BinName="cilium-map"
@@ -68,11 +116,25 @@ func dumpMap(ctx *cli.Context) {
 
 	ciliumMapType := ctx.Args().Get(1)
 	if len(ciliumMapType)==0 {
+               lastLen:=0
+               for _,v:=range GloablInfo {
+                   if len(v.mathPrefix)>0 && strings.Contains( filepath.Base(mapPath) , v.mathPrefix) {
+                        if len(v.mathPrefix)>lastLen {
+                           lastLen=len(v.mathPrefix)
+                           ciliumMapType=v.name
+                        }
+                   }
+                }
+
+                if len(ciliumMapType)>0 {
+                        fmt.Fprintf(os.Stderr,"set type to %v \n", ciliumMapType)
+                        goto OUT
+                }
 		fmt.Fprintf(os.Stderr, "error, miss cilium-map type \n", )
 		fmt.Printf("%s\n", Usage() )
 		os.Exit(1)
 	}
-
+OUT:
 	for _,v:=range GloablInfo {
 		if v.name==ciliumMapType {
 			v.handler(mapPath)

@@ -25,6 +25,7 @@ github.com/cilium/cilium/api/v1/health/client/connectivity
 github.com/cilium/cilium/api/v1/health/client/restapi
 github.com/cilium/cilium/api/v1/health/models
 github.com/cilium/cilium/api/v1/models
+github.com/cilium/cilium/pkg/addressing
 github.com/cilium/cilium/pkg/api
 github.com/cilium/cilium/pkg/bpf
 github.com/cilium/cilium/pkg/bpf/binary
@@ -48,6 +49,9 @@ github.com/cilium/cilium/pkg/labels
 github.com/cilium/cilium/pkg/lock
 github.com/cilium/cilium/pkg/logging
 github.com/cilium/cilium/pkg/logging/logfields
+github.com/cilium/cilium/pkg/mac
+github.com/cilium/cilium/pkg/maps/bwmap
+github.com/cilium/cilium/pkg/maps/lxcmap
 github.com/cilium/cilium/pkg/maps/metricsmap
 github.com/cilium/cilium/pkg/metrics
 github.com/cilium/cilium/pkg/monitor/api
