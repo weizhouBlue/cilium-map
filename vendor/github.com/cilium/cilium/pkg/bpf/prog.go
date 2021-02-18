@@ -33,6 +33,14 @@ const (
 	ProgTypeLwtOut
 	ProgTypeLwtXmit
 	ProgTypeSockOps
+	ProgTypeSkSkb
+	ProgTypeCgroupDevice
+	ProgTypeSkMsg
+	ProgTypeRawTracepoint
+	ProgTypeCgroupSockAddr
+	ProgTypeLwtSeg6Local
+	ProgTypeLircMode2
+	ProgTypeSkReusePort
 )
 
 func (t ProgType) String() string {
@@ -63,6 +71,22 @@ func (t ProgType) String() string {
 		return "LWT xmit"
 	case ProgTypeSockOps:
 		return "Sock ops"
+	case ProgTypeSkSkb:
+		return "Socket skb"
+	case ProgTypeCgroupDevice:
+		return "Cgroup device"
+	case ProgTypeSkMsg:
+		return "Socket msg"
+	case ProgTypeRawTracepoint:
+		return "Raw tracepoint"
+	case ProgTypeCgroupSockAddr:
+		return "Cgroup sockaddr"
+	case ProgTypeLwtSeg6Local:
+		return "LWT seg6local"
+	case ProgTypeLircMode2:
+		return "LIRC"
+	case ProgTypeSkReusePort:
+		return "Socket SO_REUSEPORT"
 	}
 
 	return "Unknown"

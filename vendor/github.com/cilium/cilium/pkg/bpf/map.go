@@ -1,4 +1,4 @@
-// Copyright 2016-2017 Authors of Cilium
+// Copyright 2016-2019 Authors of Cilium
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,21 +15,17 @@
 package bpf
 
 import (
-	"bufio"
-	"fmt"
-	"os"
-	"path"
-	"sync"
-	"unsafe"
+	"regexp"
+	"time"
 
-	log "github.com/Sirupsen/logrus"
-	"golang.org/x/sys/unix"
+	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/datapath/linux/probes"
 )
 
 // MapType is an enumeration for valid BPF map types
 type MapType int
 
-// This enumeration must be in sync with enum bpf_prog_type in <linux/bpf.h>
+// This enumeration must be in sync with enum bpf_map_type in <linux/bpf.h>
 const (
 	MapTypeUnspec MapType = iota
 	MapTypeHash
@@ -45,6 +41,31 @@ const (
 	MapTypeLPMTrie
 	MapTypeArrayOfMaps
 	MapTypeHashOfMaps
+	MapTypeDevMap
+	MapTypeSockMap
+	MapTypeCPUMap
+	MapTypeXSKMap
+	MapTypeSockHash
+	// MapTypeMaximum is the maximum supported known map type.
+	MapTypeMaximum
+
+	// maxSyncErrors is the maximum consecutive errors syncing before the
+	// controller bails out
+	maxSyncErrors = 512
+
+	// errorResolverSchedulerMinInterval is the minimum interval for the
+	// error resolver to be scheduled. This minimum interval ensures not to
+	// overschedule if a large number of updates fail in a row.
+	errorResolverSchedulerMinInterval = 5 * time.Second
+
+	// errorResolverSchedulerDelay is the delay to update the controller
+	// after determination that a run is needed. The delay allows to
+	// schedule the resolver after series of updates have failed.
+	errorResolverSchedulerDelay = 200 * time.Millisecond
+)
+
+var (
+	mapControllers = controller.NewManager()
 )
 
 func (t MapType) String() string {
@@ -75,440 +96,91 @@ func (t MapType) String() string {
 		return "Array of maps"
 	case MapTypeHashOfMaps:
 		return "Hash of maps"
+	case MapTypeDevMap:
+		return "Device Map"
+	case MapTypeSockMap:
+		return "Socket Map"
+	case MapTypeCPUMap:
+		return "CPU Redirect Map"
+	case MapTypeSockHash:
+		return "Socket Hash"
 	}
 
 	return "Unknown"
 }
 
-type MapKey interface {
-	// Returns pointer to start of key
-	GetKeyPtr() unsafe.Pointer
-
-	// Allocates a new value matching the key type
-	NewValue() MapValue
+func (t MapType) allowsPreallocation() bool {
+	return t != MapTypeLPMTrie
 }
 
-type MapValue interface {
-	// Returns pointer to start of value
-	GetValuePtr() unsafe.Pointer
+func (t MapType) requiresPreallocation() bool {
+	switch t {
+	case MapTypeHash, MapTypePerCPUHash, MapTypeLPMTrie, MapTypeHashOfMaps:
+		return false
+	}
+	return true
 }
 
-type MapInfo struct {
-	MapType       MapType
-	KeySize       uint32
-	ValueSize     uint32
-	MaxEntries    uint32
-	Flags         uint32
-	OwnerProgType ProgType
-}
+// DesiredAction is the action to be performed on the BPF map
+type DesiredAction int
 
-type Map struct {
-	MapInfo
-	fd   int
-	name string
-	path string
-	once sync.Once
-	lock sync.RWMutex
+const (
+	// OK indicates that to further action is required and the entry is in
+	// sync
+	OK DesiredAction = iota
 
-	// NonPersistent is true if the map does not contain persistent data
-	// and should be removed on startup.
-	NonPersistent bool
-}
+	// Insert indicates that the entry needs to be created or updated
+	Insert
 
-func NewMap(name string, mapType MapType, keySize int, valueSize int, maxEntries int, flags uint32) *Map {
-	return &Map{
-		MapInfo: MapInfo{
-			MapType:       mapType,
-			KeySize:       uint32(keySize),
-			ValueSize:     uint32(valueSize),
-			MaxEntries:    uint32(maxEntries),
-			Flags:         flags,
-			OwnerProgType: ProgTypeUnspec,
-		},
-		name: name,
+	// Delete indicates that the entry needs to be deleted
+	Delete
+)
+
+func (d DesiredAction) String() string {
+	switch d {
+	case OK:
+		return "sync"
+	case Insert:
+		return "to-be-inserted"
+	case Delete:
+		return "to-be-deleted"
+	default:
+		return "unknown"
 	}
 }
 
-// WithNonPersistent turns the map non-persistent and returns the map
-func (m *Map) WithNonPersistent() *Map {
-	m.NonPersistent = true
-	return m
-}
-
-func (m *Map) GetFd() int {
-	return m.fd
-}
-
-func GetMapInfo(pid int, fd int) (*MapInfo, error) {
-
-	fdinfoFile := fmt.Sprintf("/proc/%d/fdinfo/%d", pid, fd)
-
-	file, err := os.Open(fdinfoFile)
-	if err != nil {
-		return nil, err
+// GetMapType determines whether the specified map type is supported by the
+// kernel (as determined by bpftool feature checks), and if the map type is not
+// supported, returns a more primitive map type that may be used to implement
+// the map on older implementations. Otherwise, returns the specified map type.
+func GetMapType(t MapType) MapType {
+	pm := probes.NewProbeManager()
+	supportedMapTypes := pm.GetMapTypes()
+	switch t {
+	case MapTypeLPMTrie:
+		fallthrough
+	case MapTypeLRUHash:
+		if !supportedMapTypes.HaveLruHashMapType {
+			return MapTypeHash
+		}
 	}
-	defer file.Close()
+	return t
+}
 
-	info := &MapInfo{}
+var commonNameRegexps = []*regexp.Regexp{
+	regexp.MustCompile(`^(cilium_)(.+)_reserved_[0-9]+$`),
+	regexp.MustCompile(`^(cilium_)(.+)_netdev_ns_[0-9]+$`),
+	regexp.MustCompile(`^(cilium_)(.+)_overlay_[0-9]+$`),
+	regexp.MustCompile(`^(cilium_)(.+)_[0-9]+$`),
+	regexp.MustCompile(`^(cilium_)(.+)+$`),
+}
 
-	scanner := bufio.NewScanner(file)
-	scanner.Split(bufio.ScanLines)
-	for scanner.Scan() {
-		var value int
-
-		line := scanner.Text()
-		if n, err := fmt.Sscanf(line, "map_type:\t%d", &value); n == 1 && err == nil {
-			info.MapType = MapType(value)
-		} else if n, err := fmt.Sscanf(line, "key_size:\t%d", &value); n == 1 && err == nil {
-			info.KeySize = uint32(value)
-		} else if n, err := fmt.Sscanf(line, "value_size:\t%d", &value); n == 1 && err == nil {
-			info.ValueSize = uint32(value)
-		} else if n, err := fmt.Sscanf(line, "max_entries:\t%d", &value); n == 1 && err == nil {
-			info.MaxEntries = uint32(value)
-		} else if n, err := fmt.Sscanf(line, "map_flags:\t%x", &value); n == 1 && err == nil {
-			info.Flags = uint32(value)
-		} else if n, err := fmt.Sscanf(line, "owner_prog_type:\t%d", &value); n == 1 && err == nil {
-			info.OwnerProgType = ProgType(value)
+func extractCommonName(name string) string {
+	for _, r := range commonNameRegexps {
+		if replaced := r.ReplaceAllString(name, `$2`); replaced != name {
+			return replaced
 		}
 	}
 
-	if scanner.Err() != nil {
-		return nil, scanner.Err()
-	}
-
-	return info, nil
-}
-
-func OpenMap(name string) (*Map, error) {
-	// Expand path if needed
-	if !path.IsAbs(name) {
-		name = MapPath(name)
-	}
-
-	fd, err := ObjGet(name)
-	if err != nil {
-		return nil, err
-	}
-
-	info, err := GetMapInfo(os.Getpid(), fd)
-	if err != nil {
-		return nil, err
-	}
-
-	if info.MapType == 0 {
-		return nil, fmt.Errorf("Unable to determine map type")
-	}
-
-	if info.KeySize == 0 {
-		return nil, fmt.Errorf("Unable to determine map key size")
-	}
-
-	return &Map{
-		MapInfo: *info,
-		fd:      fd,
-		name:    path.Base(name),
-		path:    name,
-	}, nil
-}
-
-func (m *Map) setPathIfUnset() error {
-	if m.path == "" {
-		if m.name == "" {
-			return fmt.Errorf("either path or name must be set")
-		}
-
-		m.path = MapPath(m.name)
-	}
-
-	return nil
-}
-
-func (m *Map) migrate(fd int) (bool, error) {
-	info, err := GetMapInfo(os.Getpid(), fd)
-	if err != nil {
-		return false, nil
-	}
-
-	mismatch := false
-
-	if info.MapType != m.MapType {
-		log.Infof("Map type mismatch for BPF map %s: old: %d new: %d",
-			m.path, info.MapType, m.MapType)
-		mismatch = true
-	}
-
-	if info.KeySize != m.KeySize {
-		log.Infof("Key-size mismatch for BPF map %s: old: %d new: %d",
-			m.path, info.KeySize, m.KeySize)
-		mismatch = true
-	}
-
-	if info.ValueSize != m.ValueSize {
-		log.Infof("Value-size mismatch for BPF map %s: old: %d new: %d",
-			m.path, info.ValueSize, m.ValueSize)
-		mismatch = true
-	}
-
-	if info.MaxEntries != m.MaxEntries {
-		log.Infof("Max entries mismatch for BPF map %s: old: %d new: %d",
-			m.path, info.MaxEntries, m.MaxEntries)
-		mismatch = true
-	}
-
-	if info.Flags != m.Flags {
-		log.Infof("Flags mismatch for BPF map %s: old: %d new: %d",
-			m.path, info.Flags, m.Flags)
-		mismatch = true
-	}
-	if mismatch {
-		b, err := m.containsEntries()
-		if err == nil && !b {
-			log.Infof("Safely removing empty map %s so it can be recreated", m.path)
-			os.Remove(m.path)
-			return true, nil
-		}
-
-		return false, fmt.Errorf("could not resolve BPF map mismatch (see log for details)")
-	}
-
-	return false, nil
-}
-
-func (m *Map) OpenOrCreate() (bool, error) {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	if m.fd != 0 {
-		return false, nil
-	}
-
-	if err := m.setPathIfUnset(); err != nil {
-		return false, err
-	}
-
-	// If the map represents non-persistent data, always remove the map
-	// before opening or creating.
-	if m.NonPersistent {
-		os.Remove(m.path)
-	}
-
-reopen:
-	fd, isNew, err := OpenOrCreateMap(m.path, int(m.MapType), m.KeySize, m.ValueSize, m.MaxEntries, m.Flags)
-	if err != nil {
-		return false, err
-	}
-
-	// Only persistent maps need to be migrated, non-persistent maps will
-	// have been deleted above before opening.
-	if !m.NonPersistent {
-		if retry, err := m.migrate(fd); err != nil {
-			if isNew {
-				os.Remove(m.path)
-			}
-			return false, err
-		} else if retry {
-			goto reopen
-		}
-	}
-	m.fd = fd
-
-	return isNew, nil
-}
-
-func (m *Map) Open() error {
-	var err error
-	m.once.Do(func() {
-		if m.fd != 0 {
-			err = nil
-			return
-		}
-
-		if err = m.setPathIfUnset(); err != nil {
-			return
-		}
-		var fd int
-		fd, err = ObjGet(m.path)
-		if err != nil {
-			return
-		}
-
-		m.fd = fd
-	})
-	return err
-}
-
-func (m *Map) Close() error {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	if m.fd != 0 {
-		unix.Close(m.fd)
-		m.fd = 0
-	}
-
-	return nil
-}
-
-type DumpParser func(key []byte, value []byte) (MapKey, MapValue, error)
-type DumpCallback func(key MapKey, value MapValue)
-
-func (m *Map) Dump(parser DumpParser, cb DumpCallback) error {
-	m.lock.RLock()
-	defer m.lock.RUnlock()
-
-	key := make([]byte, m.KeySize)
-	nextKey := make([]byte, m.KeySize)
-	value := make([]byte, m.ValueSize)
-
-	if err := m.Open(); err != nil {
-		return err
-	}
-
-	for {
-		err := GetNextKey(
-			m.fd,
-			unsafe.Pointer(&key[0]),
-			unsafe.Pointer(&nextKey[0]),
-		)
-
-		if err != nil {
-			break
-		}
-
-		err = LookupElement(
-			m.fd,
-			unsafe.Pointer(&nextKey[0]),
-			unsafe.Pointer(&value[0]),
-		)
-
-		if err != nil {
-			return err
-		}
-
-		k, v, err := parser(nextKey, value)
-		if err != nil {
-			return err
-		}
-
-		if cb != nil {
-			cb(k, v)
-		}
-
-		copy(key, nextKey)
-	}
-	return nil
-}
-
-// containsEntries returns true if the map contains at least one entry
-// must hold map mutex
-func (m *Map) containsEntries() (bool, error) {
-	key := make([]byte, m.KeySize)
-	nextKey := make([]byte, m.KeySize)
-	value := make([]byte, m.ValueSize)
-
-	err := GetNextKey(
-		m.fd,
-		unsafe.Pointer(&key[0]),
-		unsafe.Pointer(&nextKey[0]),
-	)
-
-	if err != nil {
-		return false, nil
-	}
-
-	err = LookupElement(
-		m.fd,
-		unsafe.Pointer(&nextKey[0]),
-		unsafe.Pointer(&value[0]),
-	)
-
-	if err != nil {
-		return false, err
-	}
-
-	return true, nil
-}
-
-func (m *Map) Lookup(key MapKey) (MapValue, error) {
-	m.lock.RLock()
-	defer m.lock.RUnlock()
-
-	value := key.NewValue()
-
-	if err := m.Open(); err != nil {
-		return nil, err
-	}
-
-	err := LookupElement(m.fd, key.GetKeyPtr(), value.GetValuePtr())
-	if err != nil {
-		return nil, err
-	}
-	return value, nil
-}
-
-func (m *Map) Update(key MapKey, value MapValue) error {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	if err := m.Open(); err != nil {
-		return err
-	}
-
-	return UpdateElement(m.fd, key.GetKeyPtr(), value.GetValuePtr(), 0)
-}
-
-func (m *Map) Delete(key MapKey) error {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	if err := m.Open(); err != nil {
-		return err
-	}
-
-	return DeleteElement(m.fd, key.GetKeyPtr())
-}
-
-// DeleteAll deletes all entries of a map by traversing the map and deleting individual
-// entries. Note that if entries are added while the taversal is in progress,
-// such entries may survive the deletion process.
-func (m *Map) DeleteAll() error {
-	m.lock.Lock()
-	defer m.lock.Unlock()
-
-	key := make([]byte, m.KeySize)
-	nextKey := make([]byte, m.KeySize)
-
-	if err := m.Open(); err != nil {
-		return err
-	}
-
-	for {
-		err := GetNextKey(
-			m.fd,
-			unsafe.Pointer(&key[0]),
-			unsafe.Pointer(&nextKey[0]),
-		)
-
-		if err != nil {
-			break
-		}
-
-		err = DeleteElement(m.fd, unsafe.Pointer(&nextKey[0]))
-		if err != nil {
-			return err
-		}
-
-		copy(key, nextKey)
-	}
-
-	return nil
-}
-
-//GetNextKey returns the next key in the Map after key.
-func (m *Map) GetNextKey(key MapKey, nextKey MapKey) error {
-	if err := m.Open(); err != nil {
-		return err
-	}
-
-	return GetNextKey(m.fd, key.GetKeyPtr(), nextKey.GetKeyPtr())
+	return name
 }
