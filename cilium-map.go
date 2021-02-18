@@ -8,9 +8,9 @@ import (
 	"strings"
 )
 
-type mapInfo {
+type mapInfo struct {
 	name string
-	handler fun(path string)
+	handler func(string)
 }
 
 var GloablInfo = []mapInfo {
@@ -23,12 +23,12 @@ var GloablInfo = []mapInfo {
 var BinName="cilium-map"
 
 func Usage() string{
-	a=""
+	a:=""
 	for _ , v:=range GloablInfo {
 		a+=v.name+"|"
 	}
 	a=strings.TrimRight(a , "|" )
-	return fmt.Sprintf(" %s dump PATH [%s] \n",a)
+	return fmt.Sprintf(" %s dump PATH [%s]",BinName, a)
 }
 
 
@@ -46,7 +46,7 @@ func main() {
 			Usage:     Usage() ,
 			ArgsUsage: "<mapName>",
 			Action:    dumpMap,
-		}
+		},
 	}
 
 	app.Run(os.Args)
@@ -60,7 +60,7 @@ func dumpMap(ctx *cli.Context) {
 	}
 
 	mapPath := ctx.Args().Get(0)
-	if len(ciliumMapType)==0 {
+	if len(mapPath)==0 {
 		fmt.Fprintf(os.Stderr, "error, miss cilium-map path \n", )
 		fmt.Printf("%s\n", Usage() )
 		os.Exit(1)
@@ -74,8 +74,8 @@ func dumpMap(ctx *cli.Context) {
 	}
 
 	for _,v:=range GloablInfo {
-		if v.Name==ciliumMapType {
-			v.handler()
+		if v.name==ciliumMapType {
+			v.handler(mapPath)
 			return
 		}
 	}
