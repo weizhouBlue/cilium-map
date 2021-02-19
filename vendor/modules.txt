@@ -8,9 +8,11 @@ github.com/StackExchange/wmi
 github.com/asaskevich/govalidator
 # github.com/beorn7/perks v1.0.1
 github.com/beorn7/perks/quantile
+# github.com/blang/semver v3.5.0+incompatible
+github.com/blang/semver
 # github.com/cespare/xxhash/v2 v2.1.1
 github.com/cespare/xxhash/v2
-# github.com/cilium/cilium v1.9.0
+# github.com/cilium/cilium v1.9.4
 ## explicit
 github.com/cilium/cilium/api/v1/client
 github.com/cilium/cilium/api/v1/client/daemon
@@ -46,23 +48,44 @@ github.com/cilium/cilium/pkg/health/defaults
 github.com/cilium/cilium/pkg/ip
 github.com/cilium/cilium/pkg/ipam/option
 github.com/cilium/cilium/pkg/labels
+github.com/cilium/cilium/pkg/loadbalancer
 github.com/cilium/cilium/pkg/lock
 github.com/cilium/cilium/pkg/logging
 github.com/cilium/cilium/pkg/logging/logfields
 github.com/cilium/cilium/pkg/mac
+github.com/cilium/cilium/pkg/maglev
 github.com/cilium/cilium/pkg/maps/bwmap
+github.com/cilium/cilium/pkg/maps/ctmap
+github.com/cilium/cilium/pkg/maps/encrypt
+github.com/cilium/cilium/pkg/maps/eppolicymap
+github.com/cilium/cilium/pkg/maps/eventsmap
+github.com/cilium/cilium/pkg/maps/fragmap
+github.com/cilium/cilium/pkg/maps/ipcache
+github.com/cilium/cilium/pkg/maps/ipmasq
+github.com/cilium/cilium/pkg/maps/lbmap
 github.com/cilium/cilium/pkg/maps/lxcmap
 github.com/cilium/cilium/pkg/maps/metricsmap
+github.com/cilium/cilium/pkg/maps/nat
+github.com/cilium/cilium/pkg/maps/neighborsmap
+github.com/cilium/cilium/pkg/maps/policymap
+github.com/cilium/cilium/pkg/maps/signalmap
+github.com/cilium/cilium/pkg/maps/sockmap
+github.com/cilium/cilium/pkg/maps/tunnel
 github.com/cilium/cilium/pkg/metrics
 github.com/cilium/cilium/pkg/monitor/api
 github.com/cilium/cilium/pkg/monitor/notifications
 github.com/cilium/cilium/pkg/mountinfo
+github.com/cilium/cilium/pkg/murmur3
 github.com/cilium/cilium/pkg/option
+github.com/cilium/cilium/pkg/policy/trafficdirection
 github.com/cilium/cilium/pkg/safetime
 github.com/cilium/cilium/pkg/spanstat
+github.com/cilium/cilium/pkg/tuple
 github.com/cilium/cilium/pkg/types
+github.com/cilium/cilium/pkg/u8proto
 github.com/cilium/cilium/pkg/uuid
 github.com/cilium/cilium/pkg/version
+github.com/cilium/cilium/pkg/versioncheck
 # github.com/cpuguy83/go-md2man/v2 v2.0.0
 github.com/cpuguy83/go-md2man/v2/md2man
 # github.com/fsnotify/fsnotify v1.4.10-0.20200417215612-7f4cf4dd2b52
@@ -75,13 +98,13 @@ github.com/go-ole/go-ole/oleutil
 # github.com/go-openapi/analysis v0.19.10
 github.com/go-openapi/analysis
 github.com/go-openapi/analysis/internal
-# github.com/go-openapi/errors v0.19.6
+# github.com/go-openapi/errors v0.19.7
 github.com/go-openapi/errors
 # github.com/go-openapi/jsonpointer v0.19.3
 github.com/go-openapi/jsonpointer
 # github.com/go-openapi/jsonreference v0.19.4
 github.com/go-openapi/jsonreference
-# github.com/go-openapi/loads v0.19.5
+# github.com/go-openapi/loads v0.19.6
 github.com/go-openapi/loads
 # github.com/go-openapi/runtime v0.19.20
 github.com/go-openapi/runtime
@@ -94,11 +117,11 @@ github.com/go-openapi/runtime/middleware/untyped
 github.com/go-openapi/runtime/security
 # github.com/go-openapi/spec v0.19.9
 github.com/go-openapi/spec
-# github.com/go-openapi/strfmt v0.19.5
+# github.com/go-openapi/strfmt v0.19.6
 github.com/go-openapi/strfmt
 # github.com/go-openapi/swag v0.19.9
 github.com/go-openapi/swag
-# github.com/go-openapi/validate v0.19.10
+# github.com/go-openapi/validate v0.19.12
 github.com/go-openapi/validate
 # github.com/go-stack/stack v1.8.0
 github.com/go-stack/stack
@@ -189,7 +212,7 @@ go.mongodb.org/mongo-driver/bson/bsonrw
 go.mongodb.org/mongo-driver/bson/bsontype
 go.mongodb.org/mongo-driver/bson/primitive
 go.mongodb.org/mongo-driver/x/bsonx/bsoncore
-# golang.org/x/net v0.0.0-20200707034311-ab3426394381
+# golang.org/x/net v0.0.0-20201110031124-69a78807bb2b
 golang.org/x/net/idna
 # golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e
 golang.org/x/sync/semaphore
@@ -204,7 +227,7 @@ golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
 golang.org/x/text/unicode/norm
 golang.org/x/text/width
-# golang.org/x/time v0.0.0-20191024005414-555d28b269f0
+# golang.org/x/time v0.0.0-20200630173020-3af7569d3a1e
 golang.org/x/time/rate
 # google.golang.org/protobuf v1.25.0
 google.golang.org/protobuf/encoding/prototext

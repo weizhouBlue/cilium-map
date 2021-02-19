@@ -3,7 +3,7 @@ module bpf-map
 go 1.14
 
 require (
-	github.com/cilium/cilium v1.9.0
+	github.com/cilium/cilium v1.9.4
 	github.com/urfave/cli v1.22.5
 	golang.org/x/sys v0.0.0-20210218085108-9555bcde0c6a // indirect
 )

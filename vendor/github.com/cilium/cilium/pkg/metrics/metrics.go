@@ -178,6 +178,9 @@ const (
 
 	// LabelVersion is the label for the version number
 	LabelVersion = "version"
+
+	// LabelDirection is the label for traffic direction
+	LabelDirection = "direction"
 )
 
 var (
@@ -343,6 +346,9 @@ var (
 
 	// ConntrackGCSize the number of entries in the conntrack table
 	ConntrackGCSize = NoOpGaugeVec
+
+	// NatGCSize the number of entries in the nat table
+	NatGCSize = NoOpGaugeVec
 
 	// ConntrackGCDuration the duration of the conntrack GC process in milliseconds.
 	ConntrackGCDuration = NoOpObserverVec
@@ -897,7 +903,7 @@ func CreateConfiguration(metricsEnabled []string) (Configuration, []prometheus.C
 				Name:      "drop_count_total",
 				Help:      "Total dropped packets, tagged by drop reason and ingress/egress direction",
 			},
-				[]string{"reason", "direction"})
+				[]string{"reason", LabelDirection})
 
 			collectors = append(collectors, DropCount)
 			c.DropCountEnabled = true
@@ -908,7 +914,7 @@ func CreateConfiguration(metricsEnabled []string) (Configuration, []prometheus.C
 				Name:      "drop_bytes_total",
 				Help:      "Total dropped bytes, tagged by drop reason and ingress/egress direction",
 			},
-				[]string{"reason", "direction"})
+				[]string{"reason", LabelDirection})
 
 			collectors = append(collectors, DropBytes)
 			c.DropBytesEnabled = true
@@ -919,7 +925,7 @@ func CreateConfiguration(metricsEnabled []string) (Configuration, []prometheus.C
 				Name:      "forward_count_total",
 				Help:      "Total forwarded packets, tagged by ingress/egress direction",
 			},
-				[]string{"direction"})
+				[]string{LabelDirection})
 
 			collectors = append(collectors, ForwardCount)
 			c.NoOpCounterVecEnabled = true
@@ -930,7 +936,7 @@ func CreateConfiguration(metricsEnabled []string) (Configuration, []prometheus.C
 				Name:      "forward_bytes_total",
 				Help:      "Total forwarded bytes, tagged by ingress/egress direction",
 			},
-				[]string{"direction"})
+				[]string{LabelDirection})
 
 			collectors = append(collectors, ForwardBytes)
 			c.ForwardBytesEnabled = true
@@ -980,6 +986,16 @@ func CreateConfiguration(metricsEnabled []string) (Configuration, []prometheus.C
 
 			collectors = append(collectors, ConntrackGCSize)
 			c.ConntrackGCSizeEnabled = true
+
+			NatGCSize = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+				Namespace: Namespace,
+				Subsystem: SubsystemDatapath,
+				Name:      "nat_gc_entries",
+				Help: "The number of alive and deleted nat entries at the end " +
+					"of a garbage collector run labeled by datapath family.",
+			}, []string{LabelDatapathFamily, LabelDirection, LabelStatus})
+
+			collectors = append(collectors, NatGCSize)
 
 		case Namespace + "_" + SubsystemDatapath + "_conntrack_gc_duration_seconds":
 			ConntrackGCDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{

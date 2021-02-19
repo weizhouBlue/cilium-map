@@ -154,6 +154,9 @@ const (
 	// EnvoyLog sets the path to a separate Envoy log file, if any
 	EnvoyLog = "envoy-log"
 
+	// GopsPort is the TCP port for the gops server.
+	GopsPort = "gops-port"
+
 	// ProxyPrometheusPort specifies the port to serve Cilium host proxy metrics on.
 	ProxyPrometheusPort = "proxy-prometheus-port"
 
@@ -383,6 +386,10 @@ const (
 
 	// CMDRef is the path to cmdref output directory
 	CMDRef = "cmdref"
+
+	// DNSMaxIPsPerRestoredRule defines the maximum number of IPs to maintain
+	// for each FQDN selector in endpoint's restored DNS rules
+	DNSMaxIPsPerRestoredRule = "dns-max-ips-per-restored-rule"
 
 	// ToFQDNsMinTTL is the minimum time, in seconds, to use DNS data for toFQDNs policies.
 	ToFQDNsMinTTL = "tofqdns-min-ttl"
@@ -867,6 +874,11 @@ const (
 	// CRDWaitTimeout is the timeout in which Cilium will exit if CRDs are not
 	// available.
 	CRDWaitTimeout = "crd-wait-timeout"
+
+	// EgressMultiHomeIPRuleCompat instructs Cilium to use a new scheme to
+	// store rules and routes under ENI and Azure IPAM modes, if false.
+	// Otherwise, it will use the old scheme.
+	EgressMultiHomeIPRuleCompat = "egress-multi-home-ip-rule-compat"
 )
 
 // HelpFlagSections to format the Cilium Agent help template.
@@ -902,6 +914,7 @@ var HelpFlagSections = []FlagsSection{
 	{
 		Name: "DNS policy flags",
 		Flags: []string{
+			DNSMaxIPsPerRestoredRule,
 			FQDNRejectResponseCode,
 			ToFQDNsMaxIPsPerHost,
 			ToFQDNsMinTTL,
@@ -1625,6 +1638,10 @@ type DaemonConfig struct {
 	PrometheusServeAddr    string
 	ToFQDNsMinTTL          int
 
+	// DNSMaxIPsPerRestoredRule defines the maximum number of IPs to maintain
+	// for each FQDN selector in endpoint's restored DNS rules
+	DNSMaxIPsPerRestoredRule int
+
 	// ToFQDNsProxyPort is the user-configured global, shared, DNS listen port used
 	// by the DNS Proxy. Both UDP and TCP are handled on the same port. When it
 	// is 0 a random port will be assigned, and can be obtained from
@@ -2011,12 +2028,12 @@ type DaemonConfig struct {
 	// LBMapEntries is the maximum number of entries allowed in BPF lbmap.
 	LBMapEntries int
 
-	// K8sServiceProxyName is the value of service.kubernetes.io/service-proxy-name label,
+	// k8sServiceProxyName is the value of service.kubernetes.io/service-proxy-name label,
 	// that identifies the service objects Cilium should handle.
 	// If the provided value is an empty string, Cilium will manage service objects when
 	// the label is not present. For more details -
 	// https://github.com/kubernetes/enhancements/blob/master/keps/sig-network/0031-20181017-kube-proxy-services-optional.md
-	K8sServiceProxyName string
+	k8sServiceProxyName string
 
 	// APIRateLimitName enables configuration of the API rate limits
 	APIRateLimit map[string]string
@@ -2024,6 +2041,16 @@ type DaemonConfig struct {
 	// CRDWaitTimeout is the timeout in which Cilium will exit if CRDs are not
 	// available.
 	CRDWaitTimeout time.Duration
+
+	// NeedsRelaxVerifier enables the relax_verifier() helper which is used
+	// to introduce state pruning points for the verifier in the datapath
+	// program.
+	NeedsRelaxVerifier bool
+
+	// EgressMultiHomeIPRuleCompat instructs Cilium to use a new scheme to
+	// store rules and routes under ENI and Azure IPAM modes, if false.
+	// Otherwise, it will use the old scheme.
+	EgressMultiHomeIPRuleCompat bool
 }
 
 var (
@@ -2042,6 +2069,7 @@ var (
 		EnableIPv6NDP:                defaults.EnableIPv6NDP,
 		EnableL7Proxy:                defaults.EnableL7Proxy,
 		EndpointStatus:               make(map[string]struct{}),
+		DNSMaxIPsPerRestoredRule:     defaults.DNSMaxIPsPerRestoredRule,
 		ToFQDNsMaxIPsPerHost:         defaults.ToFQDNsMaxIPsPerHost,
 		KVstorePeriodicSync:          defaults.KVstorePeriodicSync,
 		KVstoreConnectivityTimeout:   defaults.KVstoreConnectivityTimeout,
@@ -2185,6 +2213,13 @@ func (c *DaemonConfig) EndpointStatusIsEnabled(option string) bool {
 // LocalClusterName returns the name of the cluster Cilium is deployed in
 func (c *DaemonConfig) LocalClusterName() string {
 	return c.ClusterName
+}
+
+// K8sServiceProxyName returns the required value for the
+// service.kubernetes.io/service-proxy-name label in order for services to be
+// handled.
+func (c *DaemonConfig) K8sServiceProxyName() string {
+	return c.k8sServiceProxyName
 }
 
 // CiliumNamespaceName returns the name of the namespace in which Cilium is
@@ -2552,10 +2587,11 @@ func (c *DaemonConfig) Populate() {
 	c.PolicyAuditMode = viper.GetBool(PolicyAuditModeArg)
 	c.EnableIPv4FragmentsTracking = viper.GetBool(EnableIPv4FragmentsTrackingName)
 	c.FragmentsMapEntries = viper.GetInt(FragmentsMapEntriesName)
-	c.K8sServiceProxyName = viper.GetString(K8sServiceProxyName)
+	c.k8sServiceProxyName = viper.GetString(K8sServiceProxyName)
 	c.CRDWaitTimeout = viper.GetDuration(CRDWaitTimeout)
 	c.populateLoadBalancerSettings()
 	c.populateDevices()
+	c.EgressMultiHomeIPRuleCompat = viper.GetBool(EgressMultiHomeIPRuleCompat)
 
 	if nativeCIDR := viper.GetString(IPv4NativeRoutingCIDR); nativeCIDR != "" {
 		c.ipv4NativeRoutingCIDR = cidr.MustParseCIDR(nativeCIDR)
@@ -2569,6 +2605,7 @@ func (c *DaemonConfig) Populate() {
 	c.EnableIdentityMark = viper.GetBool(EnableIdentityMark)
 
 	// toFQDNs options
+	c.DNSMaxIPsPerRestoredRule = viper.GetInt(DNSMaxIPsPerRestoredRule)
 	c.ToFQDNsMaxIPsPerHost = viper.GetInt(ToFQDNsMaxIPsPerHost)
 	if maxZombies := viper.GetInt(ToFQDNsMaxDeferredConnectionDeletes); maxZombies >= 0 {
 		c.ToFQDNsMaxDeferredConnectionDeletes = viper.GetInt(ToFQDNsMaxDeferredConnectionDeletes)

@@ -2,112 +2,126 @@ package mapPrint
 
 import (
 	"fmt"
-	"os"
 	"github.com/cilium/cilium/pkg/bpf"
-        mapType "github.com/cilium/cilium/pkg/maps/ctmap"
+	mapType "github.com/cilium/cilium/pkg/maps/ctmap"
 )
 
+func init() {
+	v := []mapInfo{
+		mapInfo{
+			Name:       "ct4",
+			MathPrefix: "cilium_ct4_",
+			Handler: func(path string) {
+				Parse(path, &mapType.CtKey4{}, &mapType.CtEntry{}, func(key bpf.MapKey, value bpf.MapValue) {
+					k := key.(*mapType.CtKey4)
+					v := value.(*mapType.CtEntry)
 
-func ParseCt4( path string  ){
-	m, err := bpf.OpenMap(path)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to open map %s: %s\n", path, err)
-		os.Exit(1)
+					fmt.Printf("key: %+v \n", *k)
+					fmt.Printf("value: %+v\n", *v)
+					fmt.Printf("\n")
+				})
+			},
+		},
+		mapInfo{
+			Name:       "ct6",
+			MathPrefix: "cilium_ct6_",
+			Handler: func(path string) {
+				Parse(path, &mapType.CtKey6{}, &mapType.CtEntry{}, func(key bpf.MapKey, value bpf.MapValue) {
+					k := key.(*mapType.CtKey6)
+					v := value.(*mapType.CtEntry)
+
+					fmt.Printf("key: %+v \n", *k)
+					fmt.Printf("value: %+v\n", *v)
+					fmt.Printf("\n")
+				})
+			},
+		},
+		mapInfo{
+			Name:       "ct4_gloabl",
+			MathPrefix: "cilium_ct4_global",
+			Handler: func(path string) {
+				Parse(path, &mapType.CtKey4Global{}, &mapType.CtEntry{}, func(key bpf.MapKey, value bpf.MapValue) {
+					k := key.(*mapType.CtKey4Global)
+					v := value.(*mapType.CtEntry)
+
+					fmt.Printf("key: %+v \n", *k)
+					fmt.Printf("value: %+v\n", *v)
+					fmt.Printf("\n")
+				})
+			},
+		},
+		mapInfo{
+			Name:       "ct6_gloabl",
+			MathPrefix: "cilium_ct6_global",
+			Handler: func(path string) {
+				Parse(path, &mapType.CtKey6Global{}, &mapType.CtEntry{}, func(key bpf.MapKey, value bpf.MapValue) {
+					k := key.(*mapType.CtKey6Global)
+					v := value.(*mapType.CtEntry)
+
+					fmt.Printf("key: %+v \n", *k)
+					fmt.Printf("value: %+v\n", *v)
+					fmt.Printf("\n")
+				})
+			},
+		},
+		mapInfo{
+			Name:       "ct4",
+			MathPrefix: "cilium_ct_any4_",
+			Handler: func(path string) {
+				Parse(path, &mapType.CtKey4{}, &mapType.CtEntry{}, func(key bpf.MapKey, value bpf.MapValue) {
+					k := key.(*mapType.CtKey4)
+					v := value.(*mapType.CtEntry)
+
+					fmt.Printf("key: %+v \n", *k)
+					fmt.Printf("value: %+v\n", *v)
+					fmt.Printf("\n")
+				})
+			},
+		},
+		mapInfo{
+			Name:       "ct6",
+			MathPrefix: "cilium_ct_any6_",
+			Handler: func(path string) {
+				Parse(path, &mapType.CtKey6{}, &mapType.CtEntry{}, func(key bpf.MapKey, value bpf.MapValue) {
+					k := key.(*mapType.CtKey6)
+					v := value.(*mapType.CtEntry)
+
+					fmt.Printf("key: %+v \n", *k)
+					fmt.Printf("value: %+v\n", *v)
+					fmt.Printf("\n")
+				})
+			},
+		},
+		mapInfo{
+			Name:       "ct4_global",
+			MathPrefix: "cilium_ct_any4_global",
+			Handler: func(path string) {
+				Parse(path, &mapType.CtKey4Global{}, &mapType.CtEntry{}, func(key bpf.MapKey, value bpf.MapValue) {
+					k := key.(*mapType.CtKey4Global)
+					v := value.(*mapType.CtEntry)
+
+					fmt.Printf("key: %+v \n", *k)
+					fmt.Printf("value: %+v\n", *v)
+					fmt.Printf("\n")
+				})
+			},
+		},
+		mapInfo{
+			Name:       "ct6_global",
+			MathPrefix: "cilium_ct_any6_global",
+			Handler: func(path string) {
+				Parse(path, &mapType.CtKey6Global{}, &mapType.CtEntry{}, func(key bpf.MapKey, value bpf.MapValue) {
+					k := key.(*mapType.CtKey6Global)
+					v := value.(*mapType.CtEntry)
+
+					fmt.Printf("key: %+v \n", *k)
+					fmt.Printf("value: %+v\n", *v)
+					fmt.Printf("\n")
+				})
+			},
+		},
 	}
 
-        m.MapKey=&mapType.CtKey4{}
-        m.MapValue=&mapType.CtEntry{}
-        m.DumpParser = bpf.ConvertKeyValue
-	parse := func(key bpf.MapKey, value bpf.MapValue) {
-		k := key.(*mapType.CtKey4)
-		v := value.(*mapType.CtEntry)
-                fmt.Printf("key: %+v \n", *k)
-                fmt.Printf("value: %+v\n",*v)
-                fmt.Printf("\n")
-	}
+	GlobalInfo = append(GlobalInfo, v...)
 
-	err = m.DumpWithCallbackIfExists(parse)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Unable to dump map %s: %s\n", path, err)
-		os.Exit(1)
-	}
 }
-
-
-
-func ParseCt6( path string  ){
-        m, err := bpf.OpenMap(path)
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "Unable to open map %s: %s\n", path, err)
-                os.Exit(1)
-        }
-
-        m.MapKey=&mapType.CtKey6{}
-        m.MapValue=&mapType.CtEntry{}
-        m.DumpParser = bpf.ConvertKeyValue
-        parse := func(key bpf.MapKey, value bpf.MapValue) {
-                k := key.(*mapType.CtKey6)
-                v := value.(*mapType.CtEntry)
-                fmt.Printf("key: %+v \n", *k)
-                fmt.Printf("value: %+v\n",*v)
-                fmt.Printf("\n")
-        }
-
-        err = m.DumpWithCallbackIfExists(parse)
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "Unable to dump map %s: %s\n", path, err)
-                os.Exit(1)
-        }
-}
-
-
-func ParseCt4Global( path string  ){
-        m, err := bpf.OpenMap(path)
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "Unable to open map %s: %s\n", path, err)
-                os.Exit(1)
-        }
-
-        m.MapKey=&mapType.CtKey4Global{}
-        m.MapValue=&mapType.CtEntry{}
-        m.DumpParser = bpf.ConvertKeyValue
-        parse := func(key bpf.MapKey, value bpf.MapValue) {
-                k := key.(*mapType.CtKey4Global)
-                v := value.(*mapType.CtEntry)
-                fmt.Printf("key: %+v \n", *k)
-                fmt.Printf("value: %+v\n",*v)
-                fmt.Printf("\n")
-        }
-
-        err = m.DumpWithCallbackIfExists(parse)
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "Unable to dump map %s: %s\n", path, err)
-                os.Exit(1)
-        }
-}
-
-func ParseCt6Global( path string  ){
-        m, err := bpf.OpenMap(path)
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "Unable to open map %s: %s\n", path, err)
-                os.Exit(1)
-        }
-
-        m.MapKey=&mapType.CtKey6Global{}
-        m.MapValue=&mapType.CtEntry{}
-        m.DumpParser = bpf.ConvertKeyValue
-        parse := func(key bpf.MapKey, value bpf.MapValue) {
-                k := key.(*mapType.CtKey6Global)
-                v := value.(*mapType.CtEntry)
-                fmt.Printf("key: %+v \n", *k)
-                fmt.Printf("value: %+v\n",*v)
-                fmt.Printf("\n")
-        }
-
-        err = m.DumpWithCallbackIfExists(parse)
-        if err != nil {
-                fmt.Fprintf(os.Stderr, "Unable to dump map %s: %s\n", path, err)
-                os.Exit(1)
-        }
-}
-
