@@ -1,27 +1,23 @@
-// Copyright 2019 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package nat
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
-	"unsafe"
+	"math"
+	"strings"
 
+	"github.com/cilium/ebpf"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/maps/timestamp"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/tuple"
 )
@@ -46,7 +42,7 @@ const (
 // It also implements the NatMap interface.
 type Map struct {
 	bpf.Map
-	v4 bool
+	family IPFamily
 }
 
 // NatEntry is the interface describing values to the NAT map.
@@ -57,7 +53,7 @@ type NatEntry interface {
 	ToHost() NatEntry
 
 	// Dumps the Nat entry as string.
-	Dump(key NatKey, start uint64) string
+	Dump(key NatKey, toDeltaSecs func(uint64) string) string
 }
 
 // A "Record" designates a map entry (key + value), but avoid "entry" because of
@@ -78,49 +74,104 @@ type NatMap interface {
 	DumpWithCallback(bpf.DumpCallback) error
 }
 
-// NatDumpCreated returns time in seconds when NAT entry was created.
-func NatDumpCreated(dumpStart, entryCreated uint64) string {
-	tsecCreated := entryCreated / 1000000000
-	tsecStart := dumpStart / 1000000000
-
-	return fmt.Sprintf("%dsec", tsecStart-tsecCreated)
-}
-
 // NewMap instantiates a Map.
-func NewMap(name string, v4 bool, entries int) *Map {
-	var sizeKey, sizeVal int
+func NewMap(name string, family IPFamily, entries int) *Map {
 	var mapKey bpf.MapKey
 	var mapValue bpf.MapValue
 
-	if v4 {
+	if family == IPv4 {
 		mapKey = &NatKey4{}
-		sizeKey = SizeofNatKey4
 		mapValue = &NatEntry4{}
-		sizeVal = SizeofNatEntry4
 	} else {
 		mapKey = &NatKey6{}
-		sizeKey = SizeofNatKey6
 		mapValue = &NatEntry6{}
-		sizeVal = SizeofNatEntry6
 	}
+
 	return &Map{
 		Map: *bpf.NewMap(
 			name,
-			bpf.MapTypeLRUHash,
+			ebpf.LRUHash,
 			mapKey,
-			sizeKey,
 			mapValue,
-			sizeVal,
 			entries,
-			0, 0,
-			bpf.ConvertKeyValue,
-		).WithCache(),
-		v4: v4,
+			0,
+		).WithCache().
+			WithEvents(option.Config.GetEventBufferConfig(name)).
+			WithPressureMetric(),
+		family: family,
 	}
 }
 
-func (m *Map) Delete(k bpf.MapKey) error {
-	return (&m.Map).Delete(k)
+func startingChunkSize(maxEntries int) int {
+	bucketSize := math.Sqrt(float64(maxEntries * 2))
+	nearest2 := math.Log2(bucketSize)
+	return int(math.Pow(2, math.Ceil(nearest2)))
+}
+
+// ApplyBatch4 uses batch iteration to walk the map and applies fn for each batch of entries.
+func (m *Map) ApplyBatch4(fn func([]tuple.TupleKey4, []NatEntry4, int)) (count int, err error) {
+	if m.family != IPv4 {
+		return 0, fmt.Errorf("not implemented: wrong ip family: %s", m.family)
+	}
+	return applyBatchReliably(m, fn)
+}
+
+// ApplyBatch4 uses batch iteration to walk the map and applies fn for each batch of entries.
+func (m *Map) ApplyBatch6(fn func([]tuple.TupleKey6, []NatEntry6, int)) (count int, err error) {
+	if m.family != IPv6 {
+		return 0, fmt.Errorf("not implemented: wrong ip family: %s", m.family)
+	}
+	return applyBatchReliably(m, fn)
+}
+
+func applyBatchReliably[KeyType, EntryType any](m *Map, fn func([]KeyType, []EntryType, int)) (count int, err error) {
+	var chunkSize = uint32(startingChunkSize(int(m.MaxEntries())))
+	const maxRetries = 3
+	for i := 0; i < maxRetries; i++ {
+		count, err = applyBatch(m, fn, chunkSize)
+		if err != nil {
+			// Lookup batch on LRU hash map may fail if the buffer passed is not big enough to
+			// accommodate the largest bucket size in the LRU map [1]
+			// Because bucket size, in general, cannot be known, we take the number of entries until
+			// we expect to see a hash map collision: sqrt(max_entries * 2)
+			// Default NAT map size is 262144 -> 2^ceil(log2(sqrt(262144 * 2))) = 1024, with key + entry size
+			// being ~ 432 bits, this means we'll need to allocate 55kb to accommodate this iteration.
+			// To avoid unbounded growth, each ENOSPC will result in a doubling of the chuck chunkSize
+			// which will persist into subsequent calls of Stats, up to a maximum of 3 (fold-increase).
+			//
+			// [1] https://elixir.bootlin.com/linux/latest/source/kernel/bpf/hashtab.c#L1776
+			if errors.Is(err, unix.ENOSPC) {
+				chunkSize *= 2
+				continue
+			}
+			return 0, fmt.Errorf("failed to count nat map: %w", err)
+		}
+		break
+	}
+	return count, err
+}
+
+func applyBatch[TupleType any, EntryType any](m *Map, fn func([]TupleType, []EntryType, int), chunkSize uint32) (count int, err error) {
+	kout := make([]TupleType, chunkSize)
+	vout := make([]EntryType, chunkSize)
+
+	var cursor ebpf.MapBatchCursor
+	for {
+		c, batchErr := m.BatchLookup(&cursor, kout, vout, nil)
+		count += c
+		fn(kout, vout, c)
+		if batchErr != nil {
+			if errors.Is(batchErr, ebpf.ErrKeyNotExist) {
+				return count, nil // end of map, we're done iterating
+			}
+			return count, batchErr
+		}
+	}
+}
+
+func (m *Map) Delete(k bpf.MapKey) (deleted bool, err error) {
+	deleted, err = (&m.Map).SilentDelete(k)
+	return
 }
 
 func (m *Map) DumpStats() *bpf.DumpStats {
@@ -131,22 +182,50 @@ func (m *Map) DumpReliablyWithCallback(cb bpf.DumpCallback, stats *bpf.DumpStats
 	return (&m.Map).DumpReliablyWithCallback(cb, stats)
 }
 
-// DoDumpEntries iterates through Map m and writes the values of the
-// nat entries in m to a string.
-func DoDumpEntries(m NatMap) (string, error) {
-	var buffer bytes.Buffer
+// DumpEntriesWithTimeDiff iterates through Map m and writes the values of the
+// nat entries in m to a string. If clockSource is not nil, it uses it to
+// compute the time difference of each entry from now and prints that too.
+func DumpEntriesWithTimeDiff(m NatMap, clockSource *models.ClockSource) (string, error) {
+	var toDeltaSecs func(uint64) string
+	var sb strings.Builder
 
-	nsecStart, _ := bpf.GetMtime()
+	if clockSource == nil {
+		toDeltaSecs = func(t uint64) string {
+			return fmt.Sprintf("? (raw %d)", t)
+		}
+	} else {
+		now, err := timestamp.GetCTCurTime(clockSource)
+		if err != nil {
+			return "", err
+		}
+		tsConverter, err := timestamp.NewCTTimeToSecConverter(clockSource)
+		if err != nil {
+			return "", err
+		}
+		tsecNow := tsConverter(now)
+		toDeltaSecs = func(t uint64) string {
+			tsec := tsConverter(uint64(t))
+			diff := int64(tsecNow) - int64(tsec)
+			return fmt.Sprintf("%dsec ago", diff)
+		}
+	}
+
 	cb := func(k bpf.MapKey, v bpf.MapValue) {
 		key := k.(NatKey)
-		if !key.ToHost().Dump(&buffer, false) {
+		if !key.ToHost().Dump(&sb, false) {
 			return
 		}
 		val := v.(NatEntry)
-		buffer.WriteString(val.ToHost().Dump(key, nsecStart))
+		sb.WriteString(val.ToHost().Dump(key, toDeltaSecs))
 	}
 	err := m.DumpWithCallback(cb)
-	return buffer.String(), err
+	return sb.String(), err
+}
+
+// DoDumpEntries iterates through Map m and writes the values of the
+// nat entries in m to a string.
+func DoDumpEntries(m NatMap) (string, error) {
+	return DumpEntriesWithTimeDiff(m, nil)
 }
 
 // DumpEntries iterates through Map m and writes the values of the
@@ -174,9 +253,9 @@ func statStartGc(m *Map) gcStats {
 func doFlush4(m *Map) gcStats {
 	stats := statStartGc(m)
 	filterCallback := func(key bpf.MapKey, _ bpf.MapValue) {
-		err := m.Delete(key)
+		err := (&m.Map).Delete(key)
 		if err != nil {
-			log.WithError(err).WithField(logfields.Key, key.String()).Error("Unable to delete CT entry")
+			log.WithError(err).WithField(logfields.Key, key.String()).Error("Unable to delete NAT entry")
 		} else {
 			stats.deleted++
 		}
@@ -188,9 +267,9 @@ func doFlush4(m *Map) gcStats {
 func doFlush6(m *Map) gcStats {
 	stats := statStartGc(m)
 	filterCallback := func(key bpf.MapKey, _ bpf.MapValue) {
-		err := m.Delete(key)
+		err := (&m.Map).Delete(key)
 		if err != nil {
-			log.WithError(err).WithField(logfields.Key, key.String()).Error("Unable to delete CT entry")
+			log.WithError(err).WithField(logfields.Key, key.String()).Error("Unable to delete NAT entry")
 		} else {
 			stats.deleted++
 		}
@@ -201,13 +280,14 @@ func doFlush6(m *Map) gcStats {
 
 // Flush deletes all NAT mappings from the given table.
 func (m *Map) Flush() int {
-	if m.v4 {
+	if m.family == IPv4 {
 		return int(doFlush4(m).deleted)
 	}
+
 	return int(doFlush6(m).deleted)
 }
 
-func deleteMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
+func DeleteMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
 	key := NatKey4{
 		TupleKey4Global: *ctKey,
 	}
@@ -217,7 +297,7 @@ func deleteMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
 	key.DestAddr = addr
 	valMap, err := m.Lookup(&key)
 	if err == nil {
-		val := *(*NatEntry4)(unsafe.Pointer(valMap.GetValuePtr()))
+		val := *(valMap.(*NatEntry4))
 		rkey := key
 		rkey.SourceAddr = key.DestAddr
 		rkey.SourcePort = key.DestPort
@@ -225,13 +305,13 @@ func deleteMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
 		rkey.DestPort = val.Port
 		rkey.Flags = tuple.TUPLE_F_IN
 
-		m.Delete(&key)
-		m.Delete(&rkey)
+		m.SilentDelete(&key)
+		m.SilentDelete(&rkey)
 	}
 	return nil
 }
 
-func deleteMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
+func DeleteMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
 	key := NatKey6{
 		TupleKey6Global: *ctKey,
 	}
@@ -241,7 +321,7 @@ func deleteMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
 	key.DestAddr = addr
 	valMap, err := m.Lookup(&key)
 	if err == nil {
-		val := *(*NatEntry6)(unsafe.Pointer(valMap.GetValuePtr()))
+		val := *(valMap.(*NatEntry6))
 		rkey := key
 		rkey.SourceAddr = key.DestAddr
 		rkey.SourcePort = key.DestPort
@@ -249,65 +329,72 @@ func deleteMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
 		rkey.DestPort = val.Port
 		rkey.Flags = tuple.TUPLE_F_IN
 
-		m.Delete(&key)
-		m.Delete(&rkey)
+		m.SilentDelete(&key)
+		m.SilentDelete(&rkey)
 	}
 	return nil
 }
 
 // Expects ingress tuple
-func deleteSwappedMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
+func DeleteSwappedMapping4(m *Map, ctKey *tuple.TupleKey4Global) error {
 	key := NatKey4{TupleKey4Global: *ctKey}
 	// Because of #5848, we need to reverse only ports
 	port := key.SourcePort
 	key.SourcePort = key.DestPort
 	key.DestPort = port
 	key.Flags = tuple.TUPLE_F_OUT
-	m.Delete(&key)
+	m.SilentDelete(&key)
 
 	return nil
 }
 
 // Expects ingress tuple
-func deleteSwappedMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
+func DeleteSwappedMapping6(m *Map, ctKey *tuple.TupleKey6Global) error {
 	key := NatKey6{TupleKey6Global: *ctKey}
 	// Because of #5848, we need to reverse only ports
 	port := key.SourcePort
 	key.SourcePort = key.DestPort
 	key.DestPort = port
 	key.Flags = tuple.TUPLE_F_OUT
-	m.Delete(&key)
+	m.SilentDelete(&key)
 
 	return nil
 }
 
-// DeleteMapping removes a NAT mapping from the global NAT table.
-func (m *Map) DeleteMapping(key tuple.TupleKey) error {
-	if key.GetFlags()&tuple.TUPLE_F_IN != 0 {
-		if m.v4 {
-			// To delete NAT entries created by DSR
-			return deleteSwappedMapping4(m, key.(*tuple.TupleKey4Global))
-		}
-		return deleteSwappedMapping6(m, key.(*tuple.TupleKey6Global))
-	}
-
-	if m.v4 {
-		return deleteMapping4(m, key.(*tuple.TupleKey4Global))
-	}
-	return deleteMapping6(m, key.(*tuple.TupleKey6Global))
-}
-
 // GlobalMaps returns all global NAT maps.
-func GlobalMaps(ipv4, ipv6 bool) (ipv4Map, ipv6Map *Map) {
-	entries := option.Config.NATMapEntriesGlobal
-	if entries == 0 {
-		entries = option.LimitTableMax
+func GlobalMaps(ipv4, ipv6, nodeport bool) (ipv4Map, ipv6Map *Map) {
+	if !nodeport {
+		return
 	}
 	if ipv4 {
-		ipv4Map = NewMap(MapNameSnat4Global, true, entries)
+		ipv4Map = NewMap(MapNameSnat4Global, IPv4, maxEntries())
 	}
 	if ipv6 {
-		ipv6Map = NewMap(MapNameSnat6Global, false, entries)
+		ipv6Map = NewMap(MapNameSnat6Global, IPv6, maxEntries())
 	}
 	return
+}
+
+// ClusterMaps returns all NAT maps for given clusters
+func ClusterMaps(clusterID uint32, ipv4, ipv6 bool) (ipv4Map, ipv6Map *Map, err error) {
+	if ipv4 {
+		ipv4Map, err = GetClusterNATMap(clusterID, IPv4)
+		if err != nil {
+			return
+		}
+	}
+	if ipv6 {
+		ipv6Map, err = GetClusterNATMap(clusterID, IPv6)
+		if err != nil {
+			return
+		}
+	}
+	return
+}
+
+func maxEntries() int {
+	if option.Config.NATMapEntriesGlobal != 0 {
+		return option.Config.NATMapEntriesGlobal
+	}
+	return option.LimitTableMax
 }

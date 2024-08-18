@@ -1,16 +1,5 @@
-// Copyright 2016-2020 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package client
 
@@ -28,12 +17,12 @@ import (
 	"text/tabwriter"
 	"time"
 
+	runtime_client "github.com/go-openapi/runtime/client"
+	"github.com/go-openapi/strfmt"
+
 	clientapi "github.com/cilium/cilium/api/v1/client"
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/defaults"
-
-	runtime_client "github.com/go-openapi/runtime/client"
-	"github.com/go-openapi/strfmt"
 )
 
 type Client struct {
@@ -86,7 +75,7 @@ func NewDefaultClientWithTimeout(timeout time.Duration) (*Client, error) {
 	for {
 		select {
 		case <-timeoutAfter:
-			return nil, fmt.Errorf("failed to create cilium agent client after %f seconds timeout: %s", timeout.Seconds(), err)
+			return nil, fmt.Errorf("failed to create cilium agent client after %f seconds timeout: %w", timeout.Seconds(), err)
 		default:
 		}
 
@@ -99,7 +88,7 @@ func NewDefaultClientWithTimeout(timeout time.Duration) (*Client, error) {
 		for {
 			select {
 			case <-timeoutAfter:
-				return nil, fmt.Errorf("failed to create cilium agent client after %f seconds timeout: %s", timeout.Seconds(), err)
+				return nil, fmt.Errorf("failed to create cilium agent client after %f seconds timeout: %w", timeout.Seconds(), err)
 			default:
 			}
 			// This is an API call that we do to the cilium-agent to check
@@ -118,29 +107,81 @@ func NewDefaultClientWithTimeout(timeout time.Duration) (*Client, error) {
 // If host is nil then use SockPath provided by CILIUM_SOCK
 // or the cilium default SockPath
 func NewClient(host string) (*Client, error) {
+	clientTrans, err := NewRuntime(WithHost(host))
+	return &Client{*clientapi.New(clientTrans, strfmt.Default)}, err
+}
+
+type runtimeOptions struct {
+	host     string
+	basePath string
+}
+
+func WithHost(host string) func(options *runtimeOptions) {
+	return func(options *runtimeOptions) {
+		options.host = host
+	}
+}
+
+func WithBasePath(basePath string) func(options *runtimeOptions) {
+	return func(options *runtimeOptions) {
+		options.basePath = basePath
+	}
+}
+
+func NewTransport(host string) (*http.Transport, error) {
 	if host == "" {
 		host = DefaultSockPath()
 	}
-	tmp := strings.SplitN(host, "://", 2)
-	if len(tmp) != 2 {
+	schema, host, found := strings.Cut(host, "://")
+	if !found {
 		return nil, fmt.Errorf("invalid host format '%s'", host)
 	}
-
-	switch tmp[0] {
+	switch schema {
 	case "tcp":
-		if _, err := url.Parse("tcp://" + tmp[1]); err != nil {
+		if _, err := url.Parse("tcp://" + host); err != nil {
 			return nil, err
 		}
-		host = "http://" + tmp[1]
+		host = "http://" + host
 	case "unix":
-		host = tmp[1]
+	}
+	return configureTransport(nil, schema, host), nil
+}
+
+func NewRuntime(opts ...func(options *runtimeOptions)) (*runtime_client.Runtime, error) {
+	r := runtimeOptions{}
+	for _, opt := range opts {
+		opt(&r)
 	}
 
-	transport := configureTransport(nil, tmp[0], host)
+	basePath := r.basePath
+	if basePath == "" {
+		basePath = clientapi.DefaultBasePath
+	}
+
+	host := r.host
+	if host == "" {
+		host = DefaultSockPath()
+	}
+
+	_, hostHeader, found := strings.Cut(host, "://")
+	if !found {
+		return nil, fmt.Errorf("invalid host format '%s'", host)
+	}
+	if strings.HasPrefix(host, "unix") {
+		// For local communication (unix domain sockets), the hostname is not used. Leave
+		// Host header empty because otherwise it would be rejected by net/http client-side
+		// sanitization, see https://go.dev/issue/60374.
+		hostHeader = "localhost"
+	}
+
+	transport, err := NewTransport(host)
+	if err != nil {
+		return nil, err
+	}
 	httpClient := &http.Client{Transport: transport}
-	clientTrans := runtime_client.NewWithClient(tmp[1], clientapi.DefaultBasePath,
+	clientTrans := runtime_client.NewWithClient(hostHeader, basePath,
 		clientapi.DefaultSchemes, httpClient)
-	return &Client{*clientapi.New(clientTrans, strfmt.Default)}, nil
+	return clientTrans, nil
 }
 
 // Hint tries to improve the error message displayed to the user.
@@ -163,11 +204,8 @@ func Hint(err error) error {
 func timeSince(since time.Time) string {
 	out := "never"
 	if !since.IsZero() {
-		// Poor man's implementtion of time.Truncate(). Can be refined
-		// when we rebase to go 1.9
 		t := time.Since(since)
-		t -= t % time.Second
-		out = t.String() + " ago"
+		out = t.Truncate(time.Second).String() + " ago"
 	}
 
 	return out
@@ -231,9 +269,9 @@ func clusterReadiness(cluster *models.RemoteCluster) string {
 	return "ready"
 }
 
-func numReadyClusters(clustermesh *models.ClusterMeshStatus) int {
+func NumReadyClusters(clusters []*models.RemoteCluster) int {
 	numReady := 0
-	for _, cluster := range clustermesh.Clusters {
+	for _, cluster := range clusters {
 		if cluster.Ready {
 			numReady++
 		}
@@ -296,28 +334,59 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 			sort.Strings(sr.Kubernetes.K8sAPIVersions)
 			fmt.Fprintf(w, "Kubernetes APIs:\t[\"%s\"]\n", strings.Join(sr.Kubernetes.K8sAPIVersions, "\", \""))
 		}
-		if sr.KubeProxyReplacement != nil {
-			devices := ""
-			if sr.KubeProxyReplacement.Mode != models.KubeProxyReplacementModeDisabled {
-				for i, dev := range sr.KubeProxyReplacement.Devices {
-					kubeProxyDevices += dev
-					if dev == sr.KubeProxyReplacement.DirectRoutingDevice {
-						kubeProxyDevices += " (Direct Routing)"
-					}
-					if i+1 != len(sr.KubeProxyReplacement.Devices) {
-						kubeProxyDevices += ", "
-					}
+
+	}
+	if sr.KubeProxyReplacement != nil {
+		devices := ""
+		if sr.KubeProxyReplacement.Mode != models.KubeProxyReplacementModeFalse {
+			for i, dev := range sr.KubeProxyReplacement.DeviceList {
+				kubeProxyDevices += fmt.Sprintf("%s %s", dev.Name, strings.Join(dev.IP, " "))
+				if dev.Name == sr.KubeProxyReplacement.DirectRoutingDevice {
+					kubeProxyDevices += " (Direct Routing)"
 				}
-				if len(sr.KubeProxyReplacement.Devices) > 0 {
-					devices = "[" + kubeProxyDevices + "]"
+				if i+1 != len(sr.KubeProxyReplacement.Devices) {
+					kubeProxyDevices += ", "
 				}
 			}
-			fmt.Fprintf(w, "KubeProxyReplacement:\t%s\t%s\n",
-				sr.KubeProxyReplacement.Mode, devices)
+			if len(sr.KubeProxyReplacement.DeviceList) > 0 {
+				devices = "[" + kubeProxyDevices + "]"
+			}
 		}
+		fmt.Fprintf(w, "KubeProxyReplacement:\t%s\t%s\n",
+			sr.KubeProxyReplacement.Mode, devices)
 	}
+	if sr.HostFirewall != nil {
+		fmt.Fprintf(w, "Host firewall:\t%s", sr.HostFirewall.Mode)
+		if sr.HostFirewall.Mode != models.HostFirewallModeDisabled {
+			fmt.Fprintf(w, "\t[%s]", strings.Join(sr.HostFirewall.Devices, ", "))
+		}
+		fmt.Fprintf(w, "\n")
+	}
+
+	if sr.Srv6 != nil {
+		var fields []string
+
+		status := "Disabled"
+		fields = append(fields, status)
+
+		if sr.Srv6.Enabled {
+			fields[0] = "Enabled"
+			fields = append(fields, fmt.Sprintf("[encap-mode: %s]", sr.Srv6.Srv6EncapMode))
+		}
+
+		fmt.Fprintf(w, "SRv6:\t%s\n", strings.Join(fields, "\t"))
+	}
+
+	if sr.CniChaining != nil {
+		fmt.Fprintf(w, "CNI Chaining:\t%s\n", sr.CniChaining.Mode)
+	}
+
+	if sr.CniFile != nil {
+		fmt.Fprintf(w, "CNI Config file:\t%s\n", sr.CniFile.Msg)
+	}
+
 	if sr.Cilium != nil {
-		fmt.Fprintf(w, "Cilium:\t%s\t%s\n", sr.Cilium.State, sr.Cilium.Msg)
+		fmt.Fprintf(w, "Cilium:\t%s   %s\n", sr.Cilium.State, sr.Cilium.Msg)
 	}
 
 	if sr.Stale != nil {
@@ -356,7 +425,7 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 		fmt.Fprintf(w, "IPAM:\t%s\n", sr.Ipam.Status)
 		if sd.AllAddresses {
 			fmt.Fprintf(w, "Allocated addresses:\n")
-			out := []string{}
+			out := make([]string, 0, len(sr.Ipam.Allocations))
 			for ip, owner := range sr.Ipam.Allocations {
 				out = append(out, fmt.Sprintf("  %s (%s)", ip, owner))
 			}
@@ -368,18 +437,39 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 	}
 
 	if sr.ClusterMesh != nil {
-		fmt.Fprintf(w, "ClusterMesh:\t%d/%d clusters ready, %d global-services\n",
-			numReadyClusters(sr.ClusterMesh), len(sr.ClusterMesh.Clusters), sr.ClusterMesh.NumGlobalServices)
+		fmt.Fprintf(w, "ClusterMesh:\t%d/%d remote clusters ready, %d global-services\n",
+			NumReadyClusters(sr.ClusterMesh.Clusters), len(sr.ClusterMesh.Clusters), sr.ClusterMesh.NumGlobalServices)
 
-		for _, cluster := range sr.ClusterMesh.Clusters {
-			if sd.AllClusters || !cluster.Ready {
-				fmt.Fprintf(w, "   %s: %s, %d nodes, %d identities, %d services, %d failures (last: %s)\n",
-					cluster.Name, clusterReadiness(cluster), cluster.NumNodes,
-					cluster.NumIdentities, cluster.NumSharedServices,
-					cluster.NumFailures, timeSince(time.Time(cluster.LastFailure)))
-				fmt.Fprintf(w, "   └  %s\n", cluster.Status)
-			}
+		verbosity := RemoteClustersStatusNotReadyOnly
+		if sd.AllClusters {
+			verbosity = RemoteClustersStatusVerbose
 		}
+
+		FormatStatusResponseRemoteClusters(w, sr.ClusterMesh.Clusters, verbosity)
+	}
+
+	if sr.IPV4BigTCP != nil {
+		status := "Disabled"
+		if sr.IPV4BigTCP.Enabled {
+			max := fmt.Sprintf("[%d]", sr.IPV4BigTCP.MaxGSO)
+			if sr.IPV4BigTCP.MaxGRO != sr.IPV4BigTCP.MaxGSO {
+				max = fmt.Sprintf("[%d, %d]", sr.IPV4BigTCP.MaxGRO, sr.IPV4BigTCP.MaxGSO)
+			}
+			status = fmt.Sprintf("Enabled\t%s", max)
+		}
+		fmt.Fprintf(w, "IPv4 BIG TCP:\t%s\n", status)
+	}
+
+	if sr.IPV6BigTCP != nil {
+		status := "Disabled"
+		if sr.IPV6BigTCP.Enabled {
+			max := fmt.Sprintf("[%d]", sr.IPV6BigTCP.MaxGSO)
+			if sr.IPV6BigTCP.MaxGRO != sr.IPV6BigTCP.MaxGSO {
+				max = fmt.Sprintf("[%d, %d]", sr.IPV6BigTCP.MaxGRO, sr.IPV6BigTCP.MaxGSO)
+			}
+			status = fmt.Sprintf("Enabled\t%s", max)
+		}
+		fmt.Fprintf(w, "IPv6 BIG TCP:\t%s\n", status)
 	}
 
 	if sr.BandwidthManager != nil {
@@ -387,34 +477,85 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 		if !sr.BandwidthManager.Enabled {
 			status = "Disabled"
 		} else {
-			status = fmt.Sprintf("EDT with BPF\t[%s]",
+			status = fmt.Sprintf("EDT with BPF [%s] [%s]",
+				strings.ToUpper(sr.BandwidthManager.CongestionControl),
 				strings.Join(sr.BandwidthManager.Devices, ", "))
 		}
 		fmt.Fprintf(w, "BandwidthManager:\t%s\n", status)
 	}
 
-	if sr.HostRouting != nil {
-		fmt.Fprintf(w, "Host Routing:\t%s\n", sr.HostRouting.Mode)
+	if sr.Routing != nil {
+		status := "Network: " + sr.Routing.InterHostRoutingMode
+		if sr.Routing.InterHostRoutingMode == models.RoutingInterHostRoutingModeTunnel {
+			status = status + " [" + sr.Routing.TunnelProtocol + "]"
+		}
+		status = status + "\tHost: " + sr.Routing.IntraHostRoutingMode
+
+		fmt.Fprintf(w, "Routing:\t%s\n", status)
+	}
+
+	if sr.AttachMode != "" {
+		status := "Legacy TC"
+		if sr.AttachMode == models.AttachModeTcx {
+			status = "TCX"
+		}
+		fmt.Fprintf(w, "Attach Mode:\t%s\n", status)
+	}
+
+	if sr.DatapathMode != "" {
+		status := "?"
+		if sr.DatapathMode == models.DatapathModeVeth {
+			status = "veth"
+		} else if sr.DatapathMode == models.DatapathModeNetkitDashL2 {
+			status = "netkit-l2"
+		} else if sr.DatapathMode == models.DatapathModeNetkit {
+			status = "netkit"
+		}
+		fmt.Fprintf(w, "Device Mode:\t%s\n", status)
 	}
 
 	if sr.Masquerading != nil {
 		var status string
-		if !sr.Masquerading.Enabled {
-			status = "Disabled"
-		} else if sr.Masquerading.Mode == models.MasqueradingModeBPF {
-			if sr.Masquerading.IPMasqAgent {
-				status = "BPF (ip-masq-agent)"
-			} else {
-				status = "BPF"
+
+		enabled := func(enabled bool) string {
+			if enabled {
+				return "Enabled"
 			}
-			if sr.KubeProxyReplacement != nil {
-				status += fmt.Sprintf("\t[%s]\t%s",
-					strings.Join(sr.KubeProxyReplacement.Devices, ", "),
-					sr.Masquerading.SnatExclusionCidr)
+			return "Disabled"
+		}
+
+		if sr.Masquerading.EnabledProtocols == nil {
+			status = enabled(sr.Masquerading.Enabled)
+		} else if !sr.Masquerading.EnabledProtocols.IPV4 && !sr.Masquerading.EnabledProtocols.IPV6 {
+			status = enabled(false)
+		} else {
+			if sr.Masquerading.Mode == models.MasqueradingModeBPF {
+				if sr.Masquerading.IPMasqAgent {
+					status = "BPF (ip-masq-agent)"
+				} else {
+					status = "BPF"
+				}
+				if sr.KubeProxyReplacement != nil {
+					// When BPF Masquerading is enabled we don't do any masquerading for IPv6
+					// traffic so no SNAT Exclusion IPv6 CIDR is listed in status output.
+					devStr := ""
+					for i, dev := range sr.KubeProxyReplacement.DeviceList {
+						devStr += dev.Name
+						if i+1 != len(sr.KubeProxyReplacement.DeviceList) {
+							devStr += ", "
+						}
+					}
+					status += fmt.Sprintf("\t[%s]\t%s",
+						devStr,
+						sr.Masquerading.SnatExclusionCidrV4)
+				}
+
+			} else if sr.Masquerading.Mode == models.MasqueradingModeIptables {
+				status = "IPTables"
 			}
 
-		} else if sr.Masquerading.Mode == models.MasqueradingModeIptables {
-			status = "IPTables"
+			status = fmt.Sprintf("%s [IPv4: %s, IPv6: %s]", status,
+				enabled(sr.Masquerading.EnabledProtocols.IPV4), enabled(sr.Masquerading.EnabledProtocols.IPV6))
 		}
 		fmt.Fprintf(w, "Masquerading:\t%s\n", status)
 	}
@@ -468,8 +609,8 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 	}
 
 	if sr.Proxy != nil {
-		fmt.Fprintf(w, "Proxy Status:\tOK, ip %s, %d redirects active on ports %s\n",
-			sr.Proxy.IP, sr.Proxy.TotalRedirects, sr.Proxy.PortRange)
+		fmt.Fprintf(w, "Proxy Status:\tOK, ip %s, %d redirects active on ports %s, Envoy: %s\n",
+			sr.Proxy.IP, sr.Proxy.TotalRedirects, sr.Proxy.PortRange, sr.Proxy.EnvoyDeploymentMode)
 		if sd.AllRedirects && sr.Proxy.TotalRedirects > 0 {
 			out := make([]string, 0, len(sr.Proxy.Redirects)+1)
 			for _, r := range sr.Proxy.Redirects {
@@ -485,6 +626,13 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 		}
 	} else {
 		fmt.Fprintf(w, "Proxy Status:\tNo managed proxy redirect\n")
+	}
+
+	if sr.IdentityRange != nil {
+		fmt.Fprintf(w, "Global Identity Range:\tmin %d, max %d\n",
+			sr.IdentityRange.MinIdentity, sr.IdentityRange.MaxIdentity)
+	} else {
+		fmt.Fprintf(w, "Global Identity Range:\tUnknown\n")
 	}
 
 	if sr.Hubble != nil {
@@ -519,7 +667,7 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 	}
 
 	if sd.KubeProxyReplacementDetails && sr.Kubernetes != nil && sr.KubeProxyReplacement != nil {
-		var selection, mode, xdp string
+		var selection, mode, dsrMode, xdp string
 
 		lb := "Disabled"
 		cIP := "Enabled"
@@ -531,6 +679,10 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 			}
 			xdp = np.Acceleration
 			mode = np.Mode
+			if mode == models.KubeProxyReplacementFeaturesNodePortModeDSR ||
+				mode == models.KubeProxyReplacementFeaturesNodePortModeHybrid {
+				dsrMode = np.DsrMode
+			}
 			nPort = fmt.Sprintf("Enabled (Range: %d-%d)", np.PortMin, np.PortMax)
 			lb = "Enabled"
 		}
@@ -550,27 +702,71 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 			eIP = "Enabled"
 		}
 
-		protocols := ""
-		if hs := sr.KubeProxyReplacement.Features.HostReachableServices; hs.Enabled {
-			protocols = strings.Join(hs.Protocols, ", ")
+		socketLB := "Disabled"
+		if slb := sr.KubeProxyReplacement.Features.SocketLB; slb.Enabled {
+			socketLB = "Enabled"
+		}
+
+		socketLBTracing := "Disabled"
+		if st := sr.KubeProxyReplacement.Features.SocketLBTracing; st.Enabled {
+			socketLBTracing = "Enabled"
+		}
+
+		socketLBCoverage := "Full"
+		if sr.KubeProxyReplacement.Features.BpfSocketLBHostnsOnly {
+			socketLBCoverage = "Hostns-only"
+		}
+
+		gracefulTerm := "Disabled"
+		if sr.KubeProxyReplacement.Features.GracefulTermination.Enabled {
+			gracefulTerm = "Enabled"
+		}
+
+		nat46X64 := "Disabled"
+		nat46X64GW := "Disabled"
+		nat46X64SVC := "Disabled"
+		prefixes := ""
+		if sr.KubeProxyReplacement.Features.Nat46X64.Enabled {
+			nat46X64 = "Enabled"
+			if svc := sr.KubeProxyReplacement.Features.Nat46X64.Service; svc.Enabled {
+				nat46X64SVC = "Enabled"
+			}
+			if gw := sr.KubeProxyReplacement.Features.Nat46X64.Gateway; gw.Enabled {
+				nat46X64GW = "Enabled"
+				prefixes = strings.Join(gw.Prefixes, ", ")
+			}
 		}
 
 		fmt.Fprintf(w, "KubeProxyReplacement Details:\n")
 		tab := tabwriter.NewWriter(w, 0, 0, 3, ' ', 0)
 		fmt.Fprintf(tab, "  Status:\t%s\n", sr.KubeProxyReplacement.Mode)
-		if protocols != "" {
-			fmt.Fprintf(tab, "  Protocols:\t%s\n", protocols)
-		}
+		fmt.Fprintf(tab, "  Socket LB:\t%s\n", socketLB)
+		fmt.Fprintf(tab, "  Socket LB Tracing:\t%s\n", socketLBTracing)
+		fmt.Fprintf(tab, "  Socket LB Coverage:\t%s\n", socketLBCoverage)
 		if kubeProxyDevices != "" {
 			fmt.Fprintf(tab, "  Devices:\t%s\n", kubeProxyDevices)
 		}
 		if mode != "" {
 			fmt.Fprintf(tab, "  Mode:\t%s\n", mode)
 		}
+		if dsrMode != "" {
+			fmt.Fprintf(tab, "    DSR Dispatch Mode:\t%s\n", dsrMode)
+		}
 		if selection != "" {
 			fmt.Fprintf(tab, "  Backend Selection:\t%s\n", selection)
 		}
 		fmt.Fprintf(tab, "  Session Affinity:\t%s\n", affinity)
+		fmt.Fprintf(tab, "  Graceful Termination:\t%s\n", gracefulTerm)
+		if nat46X64 == "Disabled" {
+			fmt.Fprintf(tab, "  NAT46/64 Support:\t%s\n", nat46X64)
+		} else {
+			fmt.Fprintf(tab, "  NAT46/64 Support:\n")
+			fmt.Fprintf(tab, "  - Services:\t%s\n", nat46X64SVC)
+			fmt.Fprintf(tab, "  - Gateway:\t%s\n", nat46X64GW)
+			if nat46X64GW == "Enabled" && prefixes != "" {
+				fmt.Fprintf(tab, "    Prefixes:\t%s\n", prefixes)
+			}
+		}
 		if xdp != "" {
 			fmt.Fprintf(tab, "  XDP Acceleration:\t%s\n", xdp)
 		}
@@ -596,5 +792,70 @@ func FormatStatusResponse(w io.Writer, sr *models.StatusResponse, sd StatusDetai
 			fmt.Fprintf(tab, "  %s\t%d\n", m.Name, m.Size)
 		}
 		tab.Flush()
+	}
+
+	if sr.Encryption != nil {
+		var fields []string
+
+		if sr.Encryption.Msg != "" {
+			fields = append(fields, sr.Encryption.Msg)
+		} else if wg := sr.Encryption.Wireguard; wg != nil {
+			fields = append(fields, fmt.Sprintf("[NodeEncryption: %s", wg.NodeEncryption))
+			ifaces := make([]string, 0, len(wg.Interfaces))
+			for _, i := range wg.Interfaces {
+				iface := fmt.Sprintf("%s (Pubkey: %s, Port: %d, Peers: %d)",
+					i.Name, i.PublicKey, i.ListenPort, i.PeerCount)
+				ifaces = append(ifaces, iface)
+			}
+			fields = append(fields, fmt.Sprintf("%s]", strings.Join(ifaces, ", ")))
+		}
+
+		fmt.Fprintf(w, "Encryption:\t%s\t%s\n", sr.Encryption.Mode, strings.Join(fields, ", "))
+	}
+}
+
+// RemoteClustersStatusVerbosity specifies the verbosity when formatting the remote clusters status information.
+type RemoteClustersStatusVerbosity uint
+
+const (
+	// RemoteClustersStatusVerbose outputs all remote clusters information.
+	RemoteClustersStatusVerbose RemoteClustersStatusVerbosity = iota
+	// RemoteClustersStatusBrief outputs a one-line summary only for ready clusters.
+	RemoteClustersStatusBrief
+	// RemoteClustersStatusNotReadyOnly outputs the remote clusters information for non-ready clusters only.
+	RemoteClustersStatusNotReadyOnly
+)
+
+func FormatStatusResponseRemoteClusters(w io.Writer, clusters []*models.RemoteCluster, verbosity RemoteClustersStatusVerbosity) {
+	for _, cluster := range clusters {
+		if verbosity != RemoteClustersStatusNotReadyOnly || !cluster.Ready {
+			fmt.Fprintf(w, "   %s: %s, %d nodes, %d endpoints, %d identities, %d services, %d reconnections (last: %s)\n",
+				cluster.Name, clusterReadiness(cluster), cluster.NumNodes,
+				cluster.NumEndpoints, cluster.NumIdentities, cluster.NumSharedServices,
+				cluster.NumFailures, timeSince(time.Time(cluster.LastFailure)))
+
+			if verbosity == RemoteClustersStatusBrief && cluster.Ready {
+				continue
+			}
+
+			fmt.Fprintf(w, "   └  %s\n", cluster.Status)
+
+			fmt.Fprint(w, "   └  remote configuration: ")
+			if cluster.Config != nil {
+				fmt.Fprintf(w, "expected=%t, retrieved=%t", cluster.Config.Required, cluster.Config.Retrieved)
+				if cluster.Config.Retrieved {
+					fmt.Fprintf(w, ", cluster-id=%d, kvstoremesh=%t, sync-canaries=%t",
+						cluster.Config.ClusterID, cluster.Config.Kvstoremesh, cluster.Config.SyncCanaries)
+				}
+			} else {
+				fmt.Fprint(w, "expected=unknown, retrieved=unknown")
+			}
+			fmt.Fprint(w, "\n")
+
+			if cluster.Synced != nil {
+				fmt.Fprintf(w, "   └  synchronization status: nodes=%v, endpoints=%v, identities=%v, services=%v\n",
+					cluster.Synced.Nodes, cluster.Synced.Endpoints, cluster.Synced.Identities, cluster.Synced.Services)
+			}
+		}
 	}
 }

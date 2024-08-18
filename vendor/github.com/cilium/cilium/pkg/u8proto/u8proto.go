@@ -1,16 +1,5 @@
-// Copyright 2016-2017 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package u8proto
 
@@ -30,14 +19,16 @@ const (
 	TCP    U8proto = 6
 	UDP    U8proto = 17
 	ICMPv6 U8proto = 58
+	SCTP   U8proto = 132
 )
 
 var protoNames = map[U8proto]string{
-	0:  "ANY",
-	1:  "ICMP",
-	6:  "TCP",
-	17: "UDP",
-	58: "ICMPv6",
+	0:   "ANY",
+	1:   "ICMP",
+	6:   "TCP",
+	17:  "UDP",
+	58:  "ICMPv6",
+	132: "SCTP",
 }
 
 var ProtoIDs = map[string]U8proto{
@@ -47,6 +38,7 @@ var ProtoIDs = map[string]U8proto{
 	"tcp":    6,
 	"udp":    17,
 	"icmpv6": 58,
+	"sctp":   132,
 }
 
 type U8proto uint8

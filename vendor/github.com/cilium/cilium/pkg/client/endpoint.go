@@ -1,16 +1,5 @@
-// Copyright 2016-2017 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package client
 
@@ -31,6 +20,13 @@ func (c *Client) EndpointList() ([]*models.Endpoint, error) {
 	return resp.Payload, nil
 }
 
+// EndpointDeleteMany deletes multiple endpoints
+func (c *Client) EndpointDeleteMany(req *models.EndpointBatchDeleteRequest) error {
+	params := endpoint.NewDeleteEndpointParams().WithEndpoint(req).WithTimeout(api.ClientTimeout)
+	_, _, err := c.Endpoint.DeleteEndpoint(params)
+	return Hint(err)
+}
+
 // EndpointGet returns endpoint by ID
 func (c *Client) EndpointGet(id string) (*models.Endpoint, error) {
 	params := endpoint.NewGetEndpointIDParams().WithID(id).WithTimeout(api.ClientTimeout)
@@ -45,11 +41,14 @@ func (c *Client) EndpointGet(id string) (*models.Endpoint, error) {
 }
 
 // EndpointCreate creates a new endpoint
-func (c *Client) EndpointCreate(ep *models.EndpointChangeRequest) error {
+func (c *Client) EndpointCreate(ep *models.EndpointChangeRequest) (*models.Endpoint, error) {
 	id := pkgEndpointID.NewCiliumID(ep.ID)
 	params := endpoint.NewPutEndpointIDParams().WithID(id).WithEndpoint(ep).WithTimeout(api.ClientTimeout)
-	_, err := c.Endpoint.PutEndpointID(params)
-	return Hint(err)
+	resp, err := c.Endpoint.PutEndpointID(params)
+	if err != nil {
+		return nil, Hint(err)
+	}
+	return resp.Payload, nil
 }
 
 // EndpointPatch modifies the endpoint
@@ -127,7 +126,6 @@ func (c *Client) EndpointLabelsGet(id string) (*models.LabelConfiguration, error
 // label, then it will be deleted from the orchestration list and
 // added to the disabled list. Otherwise it will be removed from the
 // custom list.
-//
 func (c *Client) EndpointLabelsPatch(id string, toAdd, toDelete models.Labels) error {
 	currentCfg, err := c.EndpointLabelsGet(id)
 	if err != nil {

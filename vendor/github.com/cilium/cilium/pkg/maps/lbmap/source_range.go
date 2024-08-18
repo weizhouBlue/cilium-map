@@ -1,27 +1,17 @@
-// Copyright 2020-2021 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package lbmap
 
 import (
 	"fmt"
 	"net"
-	"unsafe"
 
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/cidr"
+	"github.com/cilium/cilium/pkg/ebpf"
+	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/types"
 )
 
@@ -43,8 +33,10 @@ type SourceRangeKey interface {
 	ToHost() SourceRangeKey
 }
 
-// +k8s:deepcopy-gen=true
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapKey
+// The compile-time check for whether the structs implement the interface
+var _ SourceRangeKey = (*SourceRangeKey4)(nil)
+var _ SourceRangeKey = (*SourceRangeKey6)(nil)
+
 type SourceRangeKey4 struct {
 	PrefixLen uint32     `align:"lpm_key"`
 	RevNATID  uint16     `align:"rev_nat_id"`
@@ -52,21 +44,25 @@ type SourceRangeKey4 struct {
 	Address   types.IPv4 `align:"addr"`
 }
 
-func (k *SourceRangeKey4) GetKeyPtr() unsafe.Pointer { return unsafe.Pointer(k) }
-func (k *SourceRangeKey4) NewValue() bpf.MapValue    { return &SourceRangeValue{} }
-func (k *SourceRangeKey4) String() string            { return fmt.Sprintf("%s", k.Address) }
+func (k *SourceRangeKey4) String() string {
+	kHost := k.ToHost().(*SourceRangeKey4)
+	return fmt.Sprintf("%s (%d)", kHost.GetCIDR().String(), kHost.GetRevNATID())
+}
+
+func (k *SourceRangeKey4) New() bpf.MapKey { return &SourceRangeKey4{} }
+
 func (k *SourceRangeKey4) ToNetwork() SourceRangeKey {
 	n := *k
 	// For some reasons rev_nat_index is stored in network byte order in
 	// the SVC BPF maps
-	n.RevNATID = byteorder.HostToNetwork(n.RevNATID).(uint16)
+	n.RevNATID = byteorder.HostToNetwork16(n.RevNATID)
 	return &n
 }
 
 // ToHost returns the key in the host byte order
 func (k *SourceRangeKey4) ToHost() SourceRangeKey {
 	h := *k
-	h.RevNATID = byteorder.NetworkToHost(h.RevNATID).(uint16)
+	h.RevNATID = byteorder.NetworkToHost16(h.RevNATID)
 	return &h
 }
 
@@ -84,8 +80,6 @@ func (k *SourceRangeKey4) GetRevNATID() uint16 {
 	return k.RevNATID
 }
 
-// +k8s:deepcopy-gen=true
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapKey
 type SourceRangeKey6 struct {
 	PrefixLen uint32     `align:"lpm_key"`
 	RevNATID  uint16     `align:"rev_nat_id"`
@@ -93,21 +87,25 @@ type SourceRangeKey6 struct {
 	Address   types.IPv6 `align:"addr"`
 }
 
-func (k *SourceRangeKey6) GetKeyPtr() unsafe.Pointer { return unsafe.Pointer(k) }
-func (k *SourceRangeKey6) NewValue() bpf.MapValue    { return &SourceRangeValue{} }
-func (k *SourceRangeKey6) String() string            { return fmt.Sprintf("%s", k.Address) }
+func (k *SourceRangeKey6) String() string {
+	kHost := k.ToHost().(*SourceRangeKey6)
+	return fmt.Sprintf("%s (%d)", kHost.GetCIDR().String(), kHost.GetRevNATID())
+}
+
+func (k *SourceRangeKey6) New() bpf.MapKey { return &SourceRangeKey6{} }
+
 func (k *SourceRangeKey6) ToNetwork() SourceRangeKey {
 	n := *k
 	// For some reasons rev_nat_index is stored in network byte order in
 	// the SVC BPF maps
-	n.RevNATID = byteorder.HostToNetwork(n.RevNATID).(uint16)
+	n.RevNATID = byteorder.HostToNetwork16(n.RevNATID)
 	return &n
 }
 
 // ToHost returns the key in the host byte order
 func (k *SourceRangeKey6) ToHost() SourceRangeKey {
 	h := *k
-	h.RevNATID = byteorder.NetworkToHost(h.RevNATID).(uint16)
+	h.RevNATID = byteorder.NetworkToHost16(h.RevNATID)
 	return &h
 }
 
@@ -125,14 +123,12 @@ func (k *SourceRangeKey6) GetRevNATID() uint16 {
 	return k.RevNATID
 }
 
-// +k8s:deepcopy-gen=true
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapValue
 type SourceRangeValue struct {
 	Pad uint8 // not used
 }
 
-func (v *SourceRangeValue) GetValuePtr() unsafe.Pointer { return unsafe.Pointer(v) }
-func (v *SourceRangeValue) String() string              { return "" }
+func (v *SourceRangeValue) String() string    { return "" }
+func (v *SourceRangeValue) New() bpf.MapValue { return &SourceRangeValue{} }
 
 var (
 	// SourceRange4Map is the BPF map for storing IPv4 service source ranges to
@@ -146,34 +142,36 @@ var (
 // initSourceRange creates the BPF maps for storing both IPv4 and IPv6
 // service source ranges.
 func initSourceRange(params InitParams) {
+	SourceRangeMapMaxEntries = params.SourceRangeMapMaxEntries
+
 	if params.IPv4 {
 		SourceRange4Map = bpf.NewMap(
 			SourceRange4MapName,
-			bpf.MapTypeLPMTrie,
-			&SourceRangeKey4{}, int(unsafe.Sizeof(SourceRangeKey4{})),
-			&SourceRangeValue{}, int(unsafe.Sizeof(SourceRangeValue{})),
-			MaxEntries,
-			bpf.BPF_F_NO_PREALLOC, 0,
-			bpf.ConvertKeyValue,
-		).WithCache()
+			ebpf.LPMTrie,
+			&SourceRangeKey4{},
+			&SourceRangeValue{},
+			SourceRangeMapMaxEntries,
+			bpf.BPF_F_NO_PREALLOC,
+		).WithCache().WithPressureMetric().
+			WithEvents(option.Config.GetEventBufferConfig(SourceRange4MapName))
 	}
 
 	if params.IPv6 {
 		SourceRange6Map = bpf.NewMap(
 			SourceRange6MapName,
-			bpf.MapTypeLPMTrie,
-			&SourceRangeKey6{}, int(unsafe.Sizeof(SourceRangeKey6{})),
-			&SourceRangeValue{}, int(unsafe.Sizeof(SourceRangeValue{})),
-			MaxEntries,
-			bpf.BPF_F_NO_PREALLOC, 0,
-			bpf.ConvertKeyValue,
-		).WithCache()
+			ebpf.LPMTrie,
+			&SourceRangeKey6{},
+			&SourceRangeValue{},
+			SourceRangeMapMaxEntries,
+			bpf.BPF_F_NO_PREALLOC,
+		).WithCache().WithPressureMetric().
+			WithEvents(option.Config.GetEventBufferConfig(SourceRange6MapName))
 	}
 }
 
 func srcRangeKey(cidr *cidr.CIDR, revNATID uint16, ipv6 bool) bpf.MapKey {
 	ones, _ := cidr.Mask.Size()
-	id := byteorder.HostToNetwork(revNATID).(uint16)
+	id := byteorder.HostToNetwork16(revNATID)
 	if ipv6 {
 		key := &SourceRangeKey6{PrefixLen: uint32(ones) + lpmPrefixLen6, RevNATID: id}
 		copy(key.Address[:], cidr.IP.To16())

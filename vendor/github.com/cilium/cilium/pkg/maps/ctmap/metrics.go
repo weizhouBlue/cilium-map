@@ -1,16 +1,5 @@
-// Copyright 2016-2018 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package ctmap
 
@@ -18,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/maps/nat"
 	"github.com/cilium/cilium/pkg/metrics"
 )
 
@@ -98,9 +88,9 @@ func (s *gcStats) finish() {
 	family := s.family.String()
 	switch s.family {
 	case gcFamilyIPv6:
-		metrics.DatapathErrors.With(labelIPv6CTDumpInterrupts).Add(float64(s.Interrupted))
+		metrics.ConntrackDumpResets.With(labelIPv6CTDumpInterrupts).Add(float64(s.Interrupted))
 	case gcFamilyIPv4:
-		metrics.DatapathErrors.With(labelIPv4CTDumpInterrupts).Add(float64(s.Interrupted))
+		metrics.ConntrackDumpResets.With(labelIPv4CTDumpInterrupts).Add(float64(s.Interrupted))
 	}
 	proto := s.proto.String()
 
@@ -132,11 +122,10 @@ type NatGCStats struct {
 	IngressAlive   uint32
 	IngressDeleted uint32
 	EgressDeleted  uint32
-	// It's not possible with the current PurgeOrphanNATEntries implementation
-	// to correctly count EgressAlive, so skip it
+	EgressAlive    uint32
 }
 
-func newNatGCStats(m NatMap, family gcFamily) NatGCStats {
+func newNatGCStats(m *nat.Map, family gcFamily) NatGCStats {
 	return NatGCStats{
 		DumpStats: m.DumpStats(),
 		Family:    family,
@@ -147,5 +136,6 @@ func (s *NatGCStats) finish() {
 	family := s.Family.String()
 	metrics.NatGCSize.WithLabelValues(family, metricsIngress, metricsAlive).Set(float64(s.IngressAlive))
 	metrics.NatGCSize.WithLabelValues(family, metricsIngress, metricsDeleted).Set(float64(s.IngressDeleted))
+	metrics.NatGCSize.WithLabelValues(family, metricsEgress, metricsAlive).Set(float64(s.EgressAlive))
 	metrics.NatGCSize.WithLabelValues(family, metricsEgress, metricsDeleted).Set(float64(s.EgressDeleted))
 }

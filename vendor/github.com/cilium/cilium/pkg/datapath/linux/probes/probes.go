@@ -1,50 +1,71 @@
-// Copyright 2019 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package probes
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"net"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
+	"text/template"
+
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/features"
+	"github.com/cilium/ebpf/link"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"golang.org/x/sys/unix"
 
 	"github.com/cilium/cilium/pkg/command/exec"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/option"
-	"golang.org/x/sys/unix"
+	"github.com/cilium/cilium/pkg/netns"
 )
 
 var (
 	log          = logging.DefaultLogger.WithField(logfields.LogSubsys, "probes")
 	once         sync.Once
 	probeManager *ProbeManager
+	tpl          = template.New("headerfile")
 )
 
-// ErrKernelConfigNotFound is the error returned if the kernel config is unavailable
-// to the cilium agent.
-var ErrKernelConfigNotFound = errors.New("Kernel Config file not found")
+func init() {
+	const content = `
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright Authors of Cilium */
+
+/* THIS FILE WAS GENERATED DURING AGENT STARTUP. */
+
+#pragma once
+
+{{- if not .Common}}
+#include "features.h"
+{{- end}}
+
+{{- range $key, $value := .Features}}
+{{- if $value}}
+#define {{$key}} 1
+{{end}}
+{{- end}}
+`
+	var err error
+	tpl, err = tpl.Parse(content)
+	if err != nil {
+		log.WithError(err).Fatal("could not parse headerfile template")
+	}
+}
+
+// ErrNotSupported indicates that a feature is not supported by the current kernel.
+var ErrNotSupported = errors.New("not supported")
 
 // KernelParam is a type based on string which represents CONFIG_* kernel
 // parameters which usually have values "y", "n" or "m".
@@ -58,6 +79,27 @@ func (kp KernelParam) Enabled() bool {
 // Module checks whether the kernel parameter is enabled as a module.
 func (kp KernelParam) Module() bool {
 	return kp == "m"
+}
+
+// kernelOption holds information about kernel parameters to probe.
+type kernelOption struct {
+	Description string
+	Enabled     bool
+	CanBeModule bool
+}
+
+type ProgramHelper struct {
+	Program ebpf.ProgramType
+	Helper  asm.BuiltinFunc
+}
+
+type miscFeatures struct {
+	HaveFibIfindex bool
+}
+
+type FeatureProbes struct {
+	ProgramHelpers map[ProgramHelper]bool
+	Misc           miscFeatures
 }
 
 // SystemConfig contains kernel configuration and sysctl parameters related to
@@ -131,17 +173,10 @@ type MapTypes struct {
 	HaveStackMapType               bool `json:"have_stack_map_type"`
 }
 
-// Misc contains bools exposing miscellaneous eBPF features.
-type Misc struct {
-	HaveLargeInsnLimit bool `json:"have_large_insn_limit"`
-}
-
 // Features contains BPF feature checks returned by bpftool.
 type Features struct {
 	SystemConfig `json:"system_config"`
 	MapTypes     `json:"map_types"`
-	Helpers      map[string][]string `json:"helpers"`
-	Misc         `json:"misc"`
 }
 
 // ProbeManager is a manager of BPF feature checks.
@@ -153,107 +188,61 @@ type ProbeManager struct {
 // feature checks.
 func NewProbeManager() *ProbeManager {
 	newProbeManager := func() {
-		var features Features
-		out, err := exec.WithTimeout(
-			defaults.ExecTimeout,
-			"bpftool", "-j", "feature", "probe",
-		).CombinedOutput(log, true)
-		if err != nil {
-			log.WithError(err).Fatal("could not run bpftool")
-		}
-		if err := json.Unmarshal(out, &features); err != nil {
-			log.WithError(err).Fatal("could not parse bpftool output")
-		}
-		probeManager = &ProbeManager{features: features}
+		probeManager = &ProbeManager{}
+		probeManager.features = probeManager.Probe()
 	}
 	once.Do(newProbeManager)
 	return probeManager
 }
 
-func (p *ProbeManager) probeSystemKernelHz() (int, error) {
+// Probe probes the underlying kernel for features.
+func (*ProbeManager) Probe() Features {
+	var features Features
 	out, err := exec.WithTimeout(
 		defaults.ExecTimeout,
-		"cilium-probe-kernel-hz",
-	).Output(log, false)
+		"bpftool", "-j", "feature", "probe",
+	).CombinedOutput(log, true)
 	if err != nil {
-		return 0, fmt.Errorf("Cannot probe CONFIG_HZ")
+		log.WithError(err).Fatal("could not run bpftool")
 	}
-	hz := 0
-	warp := 0
-	n, _ := fmt.Sscanf(string(out), "%d, %d\n", &hz, &warp)
-	if n == 2 && hz > 0 && hz < 100000 {
-		return hz, nil
+	if err := json.Unmarshal(out, &features); err != nil {
+		log.WithError(err).Fatal("could not parse bpftool output")
 	}
-	return 0, fmt.Errorf("Invalid probed CONFIG_HZ value")
-}
-
-// SystemKernelHz returns the HZ value that the kernel has been configured with.
-func (p *ProbeManager) SystemKernelHz() (int, error) {
-	config := p.features.SystemConfig
-	if config.ConfigKernelHz == "" {
-		return p.probeSystemKernelHz()
-	}
-	hz, err := strconv.Atoi(string(config.ConfigKernelHz))
-	if err != nil {
-		return 0, err
-	}
-	if hz > 0 && hz < 100000 {
-		return hz, nil
-	}
-	return 0, fmt.Errorf("Invalid CONFIG_HZ value")
+	return features
 }
 
 // SystemConfigProbes performs a check of kernel configuration parameters. It
 // returns an error when parameters required by Cilium are not enabled. It logs
 // warnings when optional parameters are not enabled.
+//
+// When kernel config file is not found, bpftool can't probe kernel configuration
+// parameter real setting, so only return error log when kernel config file exists
+// and kernel configuration parameter setting is disabled
 func (p *ProbeManager) SystemConfigProbes() error {
-	config := p.features.SystemConfig
-
+	var notFound bool
 	if !p.KernelConfigAvailable() {
-		return ErrKernelConfigNotFound
+		notFound = true
+		log.Info("Kernel config file not found: if the agent fails to start, check the system requirements at https://docs.cilium.io/en/stable/operations/system_requirements")
 	}
-
-	// Required
-	if !config.ConfigBpf.Enabled() {
-		return fmt.Errorf("CONFIG_BPF kernel parameter is required")
+	requiredParams := p.GetRequiredConfig()
+	for param, kernelOption := range requiredParams {
+		if !kernelOption.Enabled && !notFound {
+			module := ""
+			if kernelOption.CanBeModule {
+				module = " or module"
+			}
+			return fmt.Errorf("%s kernel parameter%s is required (needed for: %s)", param, module, kernelOption.Description)
+		}
 	}
-
-	if !config.ConfigBpfSyscall.Enabled() {
-		return fmt.Errorf(
-			"CONFIG_BPF_SYSCALL kernel parameter is required")
-	}
-	if !config.ConfigNetSchIngress.Enabled() && !config.ConfigNetSchIngress.Module() {
-		return fmt.Errorf(
-			"CONFIG_NET_SCH_INGRESS kernel parameter (or module) is required")
-	}
-	if !config.ConfigNetClsBpf.Enabled() && !config.ConfigNetClsBpf.Module() {
-		return fmt.Errorf(
-			"CONFIG_NET_CLS_BPF kernel parameter (or module) is required")
-	}
-	if !config.ConfigNetClsAct.Enabled() {
-		return fmt.Errorf(
-			"CONFIG_NET_CLS_ACT kernel parameter is required")
-	}
-	if !config.ConfigBpfJit.Enabled() {
-		return fmt.Errorf(
-			"CONFIG_BPF_JIT kernel parameter is required")
-	}
-	if !config.ConfigHaveEbpfJit.Enabled() {
-		return fmt.Errorf(
-			"CONFIG_HAVE_EBPF_JIT kernel parameter is required")
-	}
-	// Optional
-	if !config.ConfigCgroupBpf.Enabled() {
-		log.Warning(
-			"CONFIG_CGROUP_BPF optional kernel parameter is not in kernel configuration")
-	}
-	if !config.ConfigLwtunnelBpf.Enabled() {
-		log.Warning(
-			"CONFIG_LWTUNNEL_BPF optional kernel parameter is not in kernel configuration")
-	}
-	if !config.ConfigBpfEvents.Enabled() {
-		log.Warning(
-			"CONFIG_BPF_EVENTS optional kernel parameter is not in kernel configuration")
+	optionalParams := p.GetOptionalConfig()
+	for param, kernelOption := range optionalParams {
+		if !kernelOption.Enabled && !notFound {
+			module := ""
+			if kernelOption.CanBeModule {
+				module = " or module"
+			}
+			log.Warningf("%s optional kernel parameter%s is not in kernel (needed for: %s)", param, module, kernelOption.Description)
+		}
 	}
 	return nil
 }
@@ -261,17 +250,46 @@ func (p *ProbeManager) SystemConfigProbes() error {
 // GetRequiredConfig performs a check of mandatory kernel configuration options. It
 // returns a map indicating which required kernel parameters are enabled - and which are not.
 // GetRequiredConfig is being used by CLI "cilium kernel-check".
-func (p *ProbeManager) GetRequiredConfig() map[KernelParam]bool {
+func (p *ProbeManager) GetRequiredConfig() map[KernelParam]kernelOption {
 	config := p.features.SystemConfig
-	kernelParams := make(map[KernelParam]bool)
+	coreInfraDescription := "Essential eBPF infrastructure"
+	kernelParams := make(map[KernelParam]kernelOption)
 
-	kernelParams["CONFIG_BPF"] = config.ConfigBpf.Enabled()
-	kernelParams["CONFIG_BPF_SYSCALL"] = config.ConfigBpfSyscall.Enabled()
-	kernelParams["CONFIG_NET_SCH_INGRESS"] = config.ConfigNetSchIngress.Enabled()
-	kernelParams["CONFIG_NET_CLS_BPF"] = config.ConfigNetClsBpf.Enabled()
-	kernelParams["CONFIG_NET_CLS_ACT"] = config.ConfigNetClsAct.Enabled()
-	kernelParams["CONFIG_BPF_JIT"] = config.ConfigBpfJit.Enabled()
-	kernelParams["CONFIG_HAVE_EBPF_JIT"] = config.ConfigHaveEbpfJit.Enabled()
+	kernelParams["CONFIG_BPF"] = kernelOption{
+		Enabled:     config.ConfigBpf.Enabled(),
+		Description: coreInfraDescription,
+		CanBeModule: false,
+	}
+	kernelParams["CONFIG_BPF_SYSCALL"] = kernelOption{
+		Enabled:     config.ConfigBpfSyscall.Enabled(),
+		Description: coreInfraDescription,
+		CanBeModule: false,
+	}
+	kernelParams["CONFIG_NET_SCH_INGRESS"] = kernelOption{
+		Enabled:     config.ConfigNetSchIngress.Enabled() || config.ConfigNetSchIngress.Module(),
+		Description: coreInfraDescription,
+		CanBeModule: true,
+	}
+	kernelParams["CONFIG_NET_CLS_BPF"] = kernelOption{
+		Enabled:     config.ConfigNetClsBpf.Enabled() || config.ConfigNetClsBpf.Module(),
+		Description: coreInfraDescription,
+		CanBeModule: true,
+	}
+	kernelParams["CONFIG_NET_CLS_ACT"] = kernelOption{
+		Enabled:     config.ConfigNetClsAct.Enabled(),
+		Description: coreInfraDescription,
+		CanBeModule: false,
+	}
+	kernelParams["CONFIG_BPF_JIT"] = kernelOption{
+		Enabled:     config.ConfigBpfJit.Enabled(),
+		Description: coreInfraDescription,
+		CanBeModule: false,
+	}
+	kernelParams["CONFIG_HAVE_EBPF_JIT"] = kernelOption{
+		Enabled:     config.ConfigHaveEbpfJit.Enabled(),
+		Description: coreInfraDescription,
+		CanBeModule: false,
+	}
 
 	return kernelParams
 }
@@ -279,104 +297,27 @@ func (p *ProbeManager) GetRequiredConfig() map[KernelParam]bool {
 // GetOptionalConfig performs a check of *optional* kernel configuration options. It
 // returns a map indicating which optional/non-mandatory kernel parameters are enabled.
 // GetOptionalConfig is being used by CLI "cilium kernel-check".
-func (p *ProbeManager) GetOptionalConfig() map[KernelParam]bool {
+func (p *ProbeManager) GetOptionalConfig() map[KernelParam]kernelOption {
 	config := p.features.SystemConfig
-	kernelParams := make(map[KernelParam]bool)
+	kernelParams := make(map[KernelParam]kernelOption)
 
-	kernelParams["CONFIG_CGROUP_BPF"] = config.ConfigCgroupBpf.Enabled()
-	kernelParams["CONFIG_LWTUNNEL_BPF"] = config.ConfigLwtunnelBpf.Enabled()
-	kernelParams["CONFIG_BPF_EVENTS"] = config.ConfigBpfEvents.Enabled()
+	kernelParams["CONFIG_CGROUP_BPF"] = kernelOption{
+		Enabled:     config.ConfigCgroupBpf.Enabled(),
+		Description: "Host Reachable Services and Sockmap optimization",
+		CanBeModule: false,
+	}
+	kernelParams["CONFIG_LWTUNNEL_BPF"] = kernelOption{
+		Enabled:     config.ConfigLwtunnelBpf.Enabled(),
+		Description: "Lightweight Tunnel hook for IP-in-IP encapsulation",
+		CanBeModule: false,
+	}
+	kernelParams["CONFIG_BPF_EVENTS"] = kernelOption{
+		Enabled:     config.ConfigBpfEvents.Enabled(),
+		Description: "Visibility and congestion management with datapath",
+		CanBeModule: false,
+	}
 
 	return kernelParams
-}
-
-// GetMapTypes returns information about supported BPF map types.
-func (p *ProbeManager) GetMapTypes() *MapTypes {
-	return &p.features.MapTypes
-}
-
-// GetMisc returns information about miscellaneous eBPF features.
-func (p *ProbeManager) GetMisc() *Misc {
-	return &p.features.Misc
-}
-
-// GetHelpers returns information about available BPF helpers for the given
-// program type.
-// If program type is not found, returns nil.
-func (p *ProbeManager) GetHelpers(prog string) map[string]struct{} {
-	for p, helpers := range p.features.Helpers {
-		if prog+"_available_helpers" == p {
-			ret := map[string]struct{}{}
-			for _, h := range helpers {
-				ret[h] = struct{}{}
-			}
-			return ret
-		}
-	}
-	return nil
-}
-
-// writeHeaders executes bpftool to generate BPF feature C macros and then
-// writes them to the given writer.
-func (p *ProbeManager) writeHeaders(featuresFile io.Writer) error {
-	cmd := exec.WithTimeout(
-		defaults.ExecTimeout, "bpftool", "feature", "probe", "macros")
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf(
-			"could not initialize stdout pipe for bpftool feature probe: %w", err)
-	}
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf(
-			"could not initialize stderr pipe for bpftool feature probe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf(
-			"could not start bpftool for bpftool feature probe: %w", err)
-	}
-
-	writer := bufio.NewWriter(featuresFile)
-	defer writer.Flush()
-
-	io.WriteString(writer, "#ifndef BPF_FEATURES_H_\n")
-	io.WriteString(writer, "#define BPF_FEATURES_H_\n\n")
-
-	io.Copy(writer, stdoutPipe)
-	if err := cmd.Wait(); err != nil {
-		stderr, err := ioutil.ReadAll(stderrPipe)
-		if err != nil {
-			return fmt.Errorf(
-				"reading from bpftool feature probe stderr pipe failed: %w", err)
-		}
-		return fmt.Errorf(
-			"bpftool feature probe did not run successfully: %s (%w)", stderr, err)
-	}
-
-	io.WriteString(writer, "#endif /* BPF_FEATURES_H_ */\n")
-
-	return nil
-}
-
-// CreateHeadersFile creates a C header file with macros indicating which BPF
-// features are available in the kernel.
-func (p *ProbeManager) CreateHeadersFile() error {
-	globalsDir := option.Config.GetGlobalsDir()
-	if err := os.MkdirAll(globalsDir, defaults.StateDirRights); err != nil {
-		return fmt.Errorf("could not create runtime directory %s: %w", globalsDir, err)
-	}
-	featuresFilePath := filepath.Join(globalsDir, "bpf_features.h")
-	featuresFile, err := os.Create(featuresFilePath)
-	if err != nil {
-		return fmt.Errorf(
-			"could not create features header file %s: %w", featuresFilePath, err)
-	}
-	defer featuresFile.Close()
-
-	if err := p.writeHeaders(featuresFile); err != nil {
-		return err
-	}
-	return nil
 }
 
 // KernelConfigAvailable checks if the Kernel Config is available on the
@@ -400,4 +341,462 @@ func (p *ProbeManager) KernelConfigAvailable() bool {
 	}
 
 	return true
+}
+
+// HaveProgramHelper is a wrapper around features.HaveProgramHelper() to
+// check if a certain BPF program/helper copmbination is supported by the kernel.
+// On unexpected probe results this function will terminate with log.Fatal().
+func HaveProgramHelper(pt ebpf.ProgramType, helper asm.BuiltinFunc) error {
+	err := features.HaveProgramHelper(pt, helper)
+	if errors.Is(err, ebpf.ErrNotSupported) {
+		return err
+	}
+	if err != nil {
+		log.WithError(err).WithField("programtype", pt).WithField("helper", helper).Fatal("failed to probe helper")
+	}
+	return nil
+}
+
+// HaveLargeInstructionLimit is a wrapper around features.HaveLargeInstructions()
+// to check if the kernel supports the 1 Million instruction limit.
+// On unexpected probe results this function will terminate with log.Fatal().
+func HaveLargeInstructionLimit() error {
+	err := features.HaveLargeInstructions()
+	if errors.Is(err, ebpf.ErrNotSupported) {
+		return err
+	}
+	if err != nil {
+		log.WithError(err).Fatal("failed to probe large instruction limit")
+	}
+	return nil
+}
+
+// HaveBoundedLoops is a wrapper around features.HaveBoundedLoops()
+// to check if the kernel supports bounded loops in BPF programs.
+// On unexpected probe results this function will terminate with log.Fatal().
+func HaveBoundedLoops() error {
+	err := features.HaveBoundedLoops()
+	if errors.Is(err, ebpf.ErrNotSupported) {
+		return err
+	}
+	if err != nil {
+		log.WithError(err).Fatal("failed to probe bounded loops")
+	}
+	return nil
+}
+
+// HaveFibIfindex checks if kernel has d1c362e1dd68 ("bpf: Always return target
+// ifindex in bpf_fib_lookup") which is 5.10+. This got merged in the same kernel
+// as the new redirect helpers.
+func HaveFibIfindex() error {
+	return features.HaveProgramHelper(ebpf.SchedCLS, asm.FnRedirectPeer)
+}
+
+// HaveV2ISA is a wrapper around features.HaveV2ISA() to check if the kernel
+// supports the V2 ISA.
+// On unexpected probe results this function will terminate with log.Fatal().
+func HaveV2ISA() error {
+	err := features.HaveV2ISA()
+	if errors.Is(err, ebpf.ErrNotSupported) {
+		return err
+	}
+	if err != nil {
+		log.WithError(err).Fatal("failed to probe V2 ISA")
+	}
+	return nil
+}
+
+// HaveV3ISA is a wrapper around features.HaveV3ISA() to check if the kernel
+// supports the V3 ISA.
+// On unexpected probe results this function will terminate with log.Fatal().
+func HaveV3ISA() error {
+	err := features.HaveV3ISA()
+	if errors.Is(err, ebpf.ErrNotSupported) {
+		return err
+	}
+	if err != nil {
+		log.WithError(err).Fatal("failed to probe V3 ISA")
+	}
+	return nil
+}
+
+// HaveTCX returns nil if the running kernel supports attaching bpf programs to
+// tcx hooks.
+var HaveTCX = sync.OnceValue(func() error {
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SchedCLS,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R0, 0),
+			asm.Return(),
+		},
+		License: "Apache-2.0",
+	})
+	if err != nil {
+		return err
+	}
+	defer prog.Close()
+
+	ns, err := netns.New()
+	if err != nil {
+		return fmt.Errorf("create netns: %w", err)
+	}
+	defer ns.Close()
+
+	// link.AttachTCX already performs its own feature detection and returns
+	// ebpf.ErrNotSupported if the host kernel doesn't have tcx.
+	return ns.Do(func() error {
+		l, err := link.AttachTCX(link.TCXOptions{
+			Program:   prog,
+			Attach:    ebpf.AttachTCXIngress,
+			Interface: 1, // lo
+			Anchor:    link.Tail(),
+		})
+		if err != nil {
+			return fmt.Errorf("creating link: %w", err)
+		}
+		if err := l.Close(); err != nil {
+			return fmt.Errorf("closing link: %w", err)
+		}
+
+		return nil
+	})
+})
+
+// HaveOuterSourceIPSupport tests whether the kernel support setting the outer
+// source IP address via the bpf_skb_set_tunnel_key BPF helper. We can't rely
+// on the verifier to reject a program using the new support because the
+// verifier just accepts any argument size for that helper; non-supported
+// fields will simply not be used. Instead, we set the outer source IP and
+// retrieve it with bpf_skb_get_tunnel_key right after. If the retrieved value
+// equals the value set, we have a confirmation the kernel supports it.
+func HaveOuterSourceIPSupport() (err error) {
+	defer func() {
+		if err != nil && !errors.Is(err, ebpf.ErrNotSupported) {
+			log.WithError(err).Fatal("failed to probe for outer source IP support")
+		}
+	}()
+
+	progSpec := &ebpf.ProgramSpec{
+		Name:    "set_tunnel_key_probe",
+		Type:    ebpf.SchedACT,
+		License: "GPL",
+	}
+	progSpec.Instructions = asm.Instructions{
+		asm.Mov.Reg(asm.R8, asm.R1),
+
+		asm.Mov.Imm(asm.R2, 0),
+		asm.StoreMem(asm.RFP, -8, asm.R2, asm.DWord),
+		asm.StoreMem(asm.RFP, -16, asm.R2, asm.DWord),
+		asm.StoreMem(asm.RFP, -24, asm.R2, asm.DWord),
+		asm.StoreMem(asm.RFP, -32, asm.R2, asm.DWord),
+		asm.StoreMem(asm.RFP, -40, asm.R2, asm.DWord),
+		asm.Mov.Imm(asm.R2, 42),
+		asm.StoreMem(asm.RFP, -44, asm.R2, asm.Word),
+		asm.Mov.Reg(asm.R2, asm.RFP),
+		asm.Add.Imm(asm.R2, -44),
+		asm.Mov.Imm(asm.R3, 44), // sizeof(struct bpf_tunnel_key) when setting the outer source IP is supported.
+		asm.Mov.Imm(asm.R4, 0),
+		asm.FnSkbSetTunnelKey.Call(),
+
+		asm.Mov.Reg(asm.R1, asm.R8),
+		asm.Mov.Reg(asm.R2, asm.RFP),
+		asm.Add.Imm(asm.R2, -44),
+		asm.Mov.Imm(asm.R3, 44),
+		asm.Mov.Imm(asm.R4, 0),
+		asm.FnSkbGetTunnelKey.Call(),
+
+		asm.LoadMem(asm.R0, asm.RFP, -44, asm.Word),
+		asm.Return(),
+	}
+	prog, err := ebpf.NewProgram(progSpec)
+	if err != nil {
+		return err
+	}
+	defer prog.Close()
+
+	pkt := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	ret, _, err := prog.Test(pkt)
+	if err != nil {
+		return err
+	}
+	if ret != 42 {
+		return ebpf.ErrNotSupported
+	}
+	return nil
+}
+
+// HaveSKBAdjustRoomL2RoomMACSupport tests whether the kernel supports the `bpf_skb_adjust_room` helper
+// with the `BPF_ADJ_ROOM_MAC` mode. To do so, we create a program that requests the passed in SKB
+// to be expanded by 20 bytes. The helper checks the `mode` argument and will return -ENOSUPP if
+// the mode is unknown. Otherwise it should resize the SKB by 20 bytes and return 0.
+func HaveSKBAdjustRoomL2RoomMACSupport() (err error) {
+	defer func() {
+		if err != nil && !errors.Is(err, ebpf.ErrNotSupported) {
+			log.WithError(err).Fatal("failed to probe for bpf_skb_adjust_room L2 room MAC support")
+		}
+	}()
+
+	progSpec := &ebpf.ProgramSpec{
+		Name:    "adjust_mac_room",
+		Type:    ebpf.SchedCLS,
+		License: "GPL",
+	}
+	progSpec.Instructions = asm.Instructions{
+		asm.Mov.Imm(asm.R2, 20), // len_diff
+		asm.Mov.Imm(asm.R3, 1),  // mode: BPF_ADJ_ROOM_MAC
+		asm.Mov.Imm(asm.R4, 0),  // flags: 0
+		asm.FnSkbAdjustRoom.Call(),
+		asm.Return(),
+	}
+	prog, err := ebpf.NewProgram(progSpec)
+	if err != nil {
+		return err
+	}
+	defer prog.Close()
+
+	// This is a Eth + IPv4 + UDP + data packet. The helper relies on a valid packet being passed in
+	// since it wants to know offsets of the different layers.
+	buf := gopacket.NewSerializeBuffer()
+	err = gopacket.SerializeLayers(buf, gopacket.SerializeOptions{},
+		&layers.Ethernet{
+			DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+			SrcMAC:       net.HardwareAddr{0x0e, 0xf5, 0x16, 0x3d, 0x6b, 0xab},
+			EthernetType: layers.EthernetTypeIPv4,
+		},
+		&layers.IPv4{
+			Version:  4,
+			IHL:      5,
+			Length:   49,
+			Id:       0xCECB,
+			TTL:      64,
+			Protocol: layers.IPProtocolUDP,
+			SrcIP:    net.IPv4(0xc0, 0xa8, 0xb2, 0x56),
+			DstIP:    net.IPv4(0xc0, 0xa8, 0xb2, 0xff),
+		},
+		&layers.UDP{
+			SrcPort: 23939,
+			DstPort: 32412,
+		},
+		gopacket.Payload("M-SEARCH * HTTP/1.1\x0d\x0a"),
+	)
+	if err != nil {
+		return fmt.Errorf("craft packet: %w", err)
+	}
+
+	ret, _, err := prog.Test(buf.Bytes())
+	if err != nil {
+		return err
+	}
+	if ret != 0 {
+		return ebpf.ErrNotSupported
+	}
+	return nil
+}
+
+// HaveDeadCodeElim tests whether the kernel supports dead code elimination.
+func HaveDeadCodeElim() error {
+	spec := ebpf.ProgramSpec{
+		Name: "test",
+		Type: ebpf.XDP,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R1, 0),
+			asm.JEq.Imm(asm.R1, 1, "else"),
+			asm.Mov.Imm(asm.R0, 2),
+			asm.Ja.Label("end"),
+			asm.Mov.Imm(asm.R0, 3).WithSymbol("else"),
+			asm.Return().WithSymbol("end"),
+		},
+	}
+
+	prog, err := ebpf.NewProgram(&spec)
+	if err != nil {
+		return fmt.Errorf("loading program: %w", err)
+	}
+
+	info, err := prog.Info()
+	if err != nil {
+		return fmt.Errorf("get prog info: %w", err)
+	}
+	infoInst, err := info.Instructions()
+	if err != nil {
+		return fmt.Errorf("get instructions: %w", err)
+	}
+
+	for _, inst := range infoInst {
+		if inst.OpCode.Class().IsJump() && inst.OpCode.JumpOp() != asm.Exit {
+			return fmt.Errorf("Jump instruction found in the final program, no dead code elimination performed")
+		}
+	}
+
+	return nil
+}
+
+// HaveIPv6Support tests whether kernel can open an IPv6 socket. This will
+// also implicitly auto-load IPv6 kernel module if available and not yet
+// loaded.
+func HaveIPv6Support() error {
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_STREAM, 0)
+	if errors.Is(err, unix.EAFNOSUPPORT) || errors.Is(err, unix.EPROTONOSUPPORT) {
+		return ErrNotSupported
+	}
+	unix.Close(fd)
+	return nil
+}
+
+// CreateHeaderFiles creates C header files with macros indicating which BPF
+// features are available in the kernel.
+func CreateHeaderFiles(headerDir string, probes *FeatureProbes) error {
+	common, err := os.Create(filepath.Join(headerDir, "features.h"))
+	if err != nil {
+		return fmt.Errorf("could not create common features header file: %w", err)
+	}
+	defer common.Close()
+	if err := writeCommonHeader(common, probes); err != nil {
+		return fmt.Errorf("could not write common features header file: %w", err)
+	}
+
+	skb, err := os.Create(filepath.Join(headerDir, "features_skb.h"))
+	if err != nil {
+		return fmt.Errorf("could not create skb related features header file: %w", err)
+	}
+	defer skb.Close()
+	if err := writeSkbHeader(skb, probes); err != nil {
+		return fmt.Errorf("could not write skb related features header file: %w", err)
+	}
+
+	xdp, err := os.Create(filepath.Join(headerDir, "features_xdp.h"))
+	if err != nil {
+		return fmt.Errorf("could not create xdp related features header file: %w", err)
+	}
+	defer xdp.Close()
+	if err := writeXdpHeader(xdp, probes); err != nil {
+		return fmt.Errorf("could not write xdp related features header file: %w", err)
+	}
+
+	return nil
+}
+
+// ExecuteHeaderProbes probes the kernel for a specific set of BPF features
+// which are currently used to generate various feature macros for the datapath.
+// The probe results returned in FeatureProbes are then used in the respective
+// function that writes the actual C macro definitions.
+// Further needed probes should be added here, while new macro strings need to
+// be added in the correct `write*Header()` function.
+func ExecuteHeaderProbes() *FeatureProbes {
+	probes := FeatureProbes{
+		ProgramHelpers: make(map[ProgramHelper]bool),
+		Misc:           miscFeatures{},
+	}
+
+	progHelpers := []ProgramHelper{
+		// common probes
+		{ebpf.CGroupSock, asm.FnGetNetnsCookie},
+		{ebpf.CGroupSockAddr, asm.FnGetNetnsCookie},
+		{ebpf.CGroupSockAddr, asm.FnGetSocketCookie},
+		{ebpf.CGroupSock, asm.FnJiffies64},
+		{ebpf.CGroupSockAddr, asm.FnJiffies64},
+		{ebpf.SchedCLS, asm.FnJiffies64},
+		{ebpf.XDP, asm.FnJiffies64},
+		{ebpf.CGroupSockAddr, asm.FnSkLookupTcp},
+		{ebpf.CGroupSockAddr, asm.FnSkLookupUdp},
+		{ebpf.CGroupSockAddr, asm.FnGetCurrentCgroupId},
+		{ebpf.CGroupSock, asm.FnSetRetval},
+		{ebpf.SchedCLS, asm.FnRedirectNeigh},
+		{ebpf.SchedCLS, asm.FnRedirectPeer},
+
+		// skb related probes
+		{ebpf.SchedCLS, asm.FnSkbChangeTail},
+		{ebpf.SchedCLS, asm.FnCsumLevel},
+
+		// xdp related probes
+		{ebpf.XDP, asm.FnXdpGetBuffLen},
+		{ebpf.XDP, asm.FnXdpLoadBytes},
+		{ebpf.XDP, asm.FnXdpStoreBytes},
+	}
+	for _, ph := range progHelpers {
+		probes.ProgramHelpers[ph] = (HaveProgramHelper(ph.Program, ph.Helper) == nil)
+	}
+
+	probes.Misc.HaveFibIfindex = (HaveFibIfindex() == nil)
+
+	return &probes
+}
+
+// writeCommonHeader defines macross for bpf/include/bpf/features.h
+func writeCommonHeader(writer io.Writer, probes *FeatureProbes) error {
+	features := map[string]bool{
+		"HAVE_NETNS_COOKIE": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSock, asm.FnGetNetnsCookie}] &&
+			probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnGetNetnsCookie}],
+		"HAVE_SOCKET_COOKIE": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnGetSocketCookie}],
+		"HAVE_JIFFIES": probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSock, asm.FnJiffies64}] &&
+			probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnJiffies64}] &&
+			probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnJiffies64}] &&
+			probes.ProgramHelpers[ProgramHelper{ebpf.XDP, asm.FnJiffies64}],
+		"HAVE_CGROUP_ID":   probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSockAddr, asm.FnGetCurrentCgroupId}],
+		"HAVE_SET_RETVAL":  probes.ProgramHelpers[ProgramHelper{ebpf.CGroupSock, asm.FnSetRetval}],
+		"HAVE_FIB_NEIGH":   probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnRedirectNeigh}],
+		"HAVE_FIB_IFINDEX": probes.Misc.HaveFibIfindex,
+	}
+
+	return writeFeatureHeader(writer, features, true)
+}
+
+// writeSkbHeader defines macros for bpf/include/bpf/features_skb.h
+func writeSkbHeader(writer io.Writer, probes *FeatureProbes) error {
+	featuresSkb := map[string]bool{
+		"HAVE_CSUM_LEVEL": probes.ProgramHelpers[ProgramHelper{ebpf.SchedCLS, asm.FnCsumLevel}],
+	}
+
+	return writeFeatureHeader(writer, featuresSkb, false)
+}
+
+// writeXdpHeader defines macros for bpf/include/bpf/features_xdp.h
+func writeXdpHeader(writer io.Writer, probes *FeatureProbes) error {
+	featuresXdp := map[string]bool{
+		"HAVE_XDP_GET_BUFF_LEN": probes.ProgramHelpers[ProgramHelper{ebpf.XDP, asm.FnXdpGetBuffLen}],
+		"HAVE_XDP_LOAD_BYTES":   probes.ProgramHelpers[ProgramHelper{ebpf.XDP, asm.FnXdpLoadBytes}],
+		"HAVE_XDP_STORE_BYTES":  probes.ProgramHelpers[ProgramHelper{ebpf.XDP, asm.FnXdpStoreBytes}],
+	}
+
+	return writeFeatureHeader(writer, featuresXdp, false)
+}
+
+func writeFeatureHeader(writer io.Writer, features map[string]bool, common bool) error {
+	input := struct {
+		Common   bool
+		Features map[string]bool
+	}{
+		Common:   common,
+		Features: features,
+	}
+
+	if err := tpl.Execute(writer, input); err != nil {
+		return fmt.Errorf("could not write template: %w", err)
+	}
+
+	return nil
+}
+
+// HaveBatchAPI checks if kernel supports batched bpf map lookup API.
+func HaveBatchAPI() error {
+	spec := ebpf.MapSpec{
+		Type:       ebpf.LRUHash,
+		KeySize:    1,
+		ValueSize:  1,
+		MaxEntries: 2,
+	}
+	m, err := ebpf.NewMapWithOptions(&spec, ebpf.MapOptions{})
+	if err != nil {
+		return ErrNotSupported
+	}
+	defer m.Close()
+	var cursor ebpf.MapBatchCursor
+	_, err = m.BatchLookup(&cursor, []byte{0}, []byte{0}, nil) // only do one batched lookup
+	if err != nil {
+		if errors.Is(err, ebpf.ErrNotSupported) {
+			return ErrNotSupported
+		}
+		return nil
+	}
+	return nil
 }

@@ -1,26 +1,21 @@
-// Copyright 2016-2019 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package tunnel
 
 import (
+	"fmt"
 	"net"
-	"unsafe"
-
-	"github.com/cilium/cilium/pkg/bpf"
+	"sync"
 
 	"github.com/sirupsen/logrus"
+
+	"github.com/cilium/cilium/pkg/bpf"
+	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
+	"github.com/cilium/cilium/pkg/ebpf"
+	ippkg "github.com/cilium/cilium/pkg/ip"
+	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/types"
 )
 
 const (
@@ -32,73 +27,182 @@ const (
 
 var (
 	// TunnelMap represents the BPF map for tunnels
-	TunnelMap = NewTunnelMap(MapName)
+	tunnelMap     *Map
+	tunnelMapInit = &sync.Once{}
 )
+
+// SetTunnelMap sets the tunnel map. Only used for testing.
+func SetTunnelMap(m *Map) {
+	if tunnelMap != nil {
+		tunnelMap.UnpinIfExists()
+	}
+
+	tunnelMap = m
+}
+
+func TunnelMap() *Map {
+	tunnelMapInit.Do(func() {
+		if tunnelMap == nil {
+			tunnelMap = NewTunnelMap(MapName)
+		}
+	})
+	return tunnelMap
+}
 
 // Map implements tunnel connectivity configuration in the BPF datapath.
 type Map struct {
 	*bpf.Map
 }
 
-// NewTunnelMap returns a new tunnel map with the specified name.
-func NewTunnelMap(name string) *Map {
-	return &Map{Map: bpf.NewMap(MapName,
-		bpf.MapTypeHash,
-		&TunnelEndpoint{},
-		int(unsafe.Sizeof(TunnelEndpoint{})),
-		&TunnelEndpoint{},
-		int(unsafe.Sizeof(TunnelEndpoint{})),
+// NewTunnelMap returns a new tunnel map.
+func NewTunnelMap(mapName string) *Map {
+	return &Map{Map: bpf.NewMap(
+		mapName,
+		ebpf.Hash,
+		&TunnelKey{},
+		&TunnelValue{},
 		MaxEntries,
-		0, 0,
-		bpf.ConvertKeyValue,
-	).WithCache(),
+		0,
+	).WithCache().WithPressureMetric().
+		WithEvents(option.Config.GetEventBufferConfig(MapName)),
 	}
-}
-
-func init() {
-	TunnelMap.NonPersistent = true
 }
 
 // +k8s:deepcopy-gen=true
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapKey
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapValue
-type TunnelEndpoint struct {
-	bpf.EndpointKey
+type TunnelIP struct {
+	// represents both IPv6 and IPv4 (in the lowest four bytes)
+	IP     types.IPv6 `align:"$union0"`
+	Family uint8      `align:"family"`
 }
 
-func newTunnelEndpoint(ip net.IP) *TunnelEndpoint {
-	return &TunnelEndpoint{
-		EndpointKey: bpf.NewEndpointKey(ip),
+type TunnelKey struct {
+	TunnelIP
+	Pad       uint8  `align:"pad"`
+	ClusterID uint16 `align:"cluster_id"`
+}
+
+// String provides a string representation of the TunnelKey.
+func (k TunnelKey) String() string {
+	if ip := k.toIP(); ip != nil {
+		addrCluster := cmtypes.AddrClusterFrom(
+			ippkg.MustAddrFromIP(ip),
+			uint32(k.ClusterID),
+		)
+		return addrCluster.String()
 	}
+	return "nil"
 }
 
-func (v TunnelEndpoint) NewValue() bpf.MapValue { return &TunnelEndpoint{} }
+func (k *TunnelKey) New() bpf.MapKey { return &TunnelKey{} }
+
+type TunnelValue struct {
+	TunnelIP
+	Key uint8  `align:"key"`
+	Pad uint16 `align:"pad"`
+}
+
+// String provides a string representation of the TunnelValue.
+func (k TunnelValue) String() string {
+	if ip := k.toIP(); ip != nil {
+		return ip.String() + ":" + fmt.Sprintf("%d", k.Key)
+	}
+	return "nil"
+}
+
+func (k *TunnelValue) New() bpf.MapValue { return &TunnelValue{} }
+
+// ToIP converts the TunnelIP into a net.IP structure.
+func (v TunnelIP) toIP() net.IP {
+	switch v.Family {
+	case bpf.EndpointKeyIPv4:
+		return v.IP[:4]
+	case bpf.EndpointKeyIPv6:
+		return v.IP[:]
+	}
+	return nil
+}
+
+func newTunnelKey(ip net.IP, clusterID uint32) (*TunnelKey, error) {
+	if clusterID > cmtypes.ClusterIDMax {
+		return nil, fmt.Errorf("ClusterID %d is too large. ClusterID > %d is not supported in TunnelMap", clusterID, cmtypes.ClusterIDMax)
+	}
+
+	result := TunnelKey{}
+	result.TunnelIP = newTunnelIP(ip)
+	result.ClusterID = uint16(clusterID)
+	return &result, nil
+}
+
+func newTunnelValue(ip net.IP, key uint8) *TunnelValue {
+	result := TunnelValue{}
+	result.TunnelIP = newTunnelIP(ip)
+	result.Key = key
+	return &result
+}
+
+func newTunnelIP(ip net.IP) TunnelIP {
+	result := TunnelIP{}
+	if ip4 := ip.To4(); ip4 != nil {
+		result.Family = bpf.EndpointKeyIPv4
+		copy(result.IP[:], ip4)
+	} else {
+		result.Family = bpf.EndpointKeyIPv6
+		copy(result.IP[:], ip)
+	}
+	return result
+}
 
 // SetTunnelEndpoint adds/replaces a prefix => tunnel-endpoint mapping
-func (m *Map) SetTunnelEndpoint(encryptKey uint8, prefix, endpoint net.IP) error {
-	key, val := newTunnelEndpoint(prefix), newTunnelEndpoint(endpoint)
-	val.EndpointKey.Key = encryptKey
+func (m *Map) SetTunnelEndpoint(encryptKey uint8, prefix cmtypes.AddrCluster, endpoint net.IP) error {
+	key, err := newTunnelKey(prefix.AsNetIP(), prefix.ClusterID())
+	if err != nil {
+		return err
+	}
+
+	val := newTunnelValue(endpoint, encryptKey)
+
 	log.WithFields(logrus.Fields{
 		fieldPrefix:   prefix,
 		fieldEndpoint: endpoint,
 		fieldKey:      encryptKey,
 	}).Debug("Updating tunnel map entry")
 
-	return TunnelMap.Update(key, val)
+	return m.Update(key, val)
 }
 
-// GetTunnelEndpoint removes a prefix => tunnel-endpoint mapping
-func (m *Map) GetTunnelEndpoint(prefix net.IP) (net.IP, error) {
-	val, err := TunnelMap.Lookup(newTunnelEndpoint(prefix))
+// GetTunnelEndpoint retrieves a prefix => tunnel-endpoint mapping
+func (m *Map) GetTunnelEndpoint(prefix cmtypes.AddrCluster) (net.IP, error) {
+	key, err := newTunnelKey(prefix.AsNetIP(), prefix.ClusterID())
 	if err != nil {
 		return net.IP{}, err
 	}
 
-	return val.(*TunnelEndpoint).ToIP(), nil
+	val, err := m.Lookup(key)
+	if err != nil {
+		return net.IP{}, err
+	}
+
+	return val.(*TunnelValue).toIP(), nil
 }
 
 // DeleteTunnelEndpoint removes a prefix => tunnel-endpoint mapping
-func (m *Map) DeleteTunnelEndpoint(prefix net.IP) error {
+func (m *Map) DeleteTunnelEndpoint(prefix cmtypes.AddrCluster) error {
+	key, err := newTunnelKey(prefix.AsNetIP(), prefix.ClusterID())
+	if err != nil {
+		return err
+	}
 	log.WithField(fieldPrefix, prefix).Debug("Deleting tunnel map entry")
-	return TunnelMap.Delete(newTunnelEndpoint(prefix))
+	return m.Delete(key)
+}
+
+// SilentDeleteTunnelEndpoint removes a prefix => tunnel-endpoint mapping.
+// If the prefix is not found no error is returned.
+func (m *Map) SilentDeleteTunnelEndpoint(prefix cmtypes.AddrCluster) error {
+	key, err := newTunnelKey(prefix.AsNetIP(), prefix.ClusterID())
+	if err != nil {
+		return err
+	}
+	log.WithField(fieldPrefix, prefix).Debug("Silently deleting tunnel map entry")
+	_, err = m.SilentDelete(key)
+	return err
 }
