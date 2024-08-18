@@ -1,54 +1,59 @@
-// Copyright 2018 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package metrics
 
 import (
 	"fmt"
 	"reflect"
-
-	"github.com/cilium/cilium/pkg/components"
-	"github.com/cilium/cilium/pkg/logging/logfields"
+	"sync"
+	"sync/atomic"
 
 	"github.com/sirupsen/logrus"
+
+	"github.com/cilium/cilium/pkg/logging/logfields"
 )
+
+var (
+	metricsInitialized chan struct{} = make(chan struct{})
+	flushMetrics                     = sync.Once{}
+)
+
+// FlushLoggingMetrics will cause all logging hook metrics accumulated prior
+// to the errors_warnings metrics being registered with the Prometheus collector
+// to be incremented to their respective errors_warnings metrics tuple.
+func FlushLoggingMetrics() {
+	flushMetrics.Do(func() {
+		if metricsInitialized != nil {
+			close(metricsInitialized)
+		}
+	})
+}
 
 // LoggingHook is a hook for logrus which counts error and warning messages as a
 // Prometheus metric.
 type LoggingHook struct {
-	metric CounterVec
+	errs, warn atomic.Uint64
 }
 
 // NewLoggingHook returns a new instance of LoggingHook for the given Cilium
 // component.
-func NewLoggingHook(component string) *LoggingHook {
-	// NOTE(mrostecki): For now errors and warning metric exists only for Cilium
-	// daemon, but support of Prometheus metrics in some other components (i.e.
-	// cilium-health - GH-4268) is planned.
-
-	// Pick a metric for the component.
-	var metric CounterVec
-	switch component {
-	case components.CiliumAgentName:
-		metric = ErrorsWarnings
-	case components.CiliumOperatortName:
-		metric = ErrorsWarnings
-	default:
-		panic(fmt.Sprintf("component %s is unsupported by LoggingHook", component))
-	}
-
-	return &LoggingHook{metric: metric}
+func NewLoggingHook() *LoggingHook {
+	lh := &LoggingHook{}
+	go func() {
+		// This channel is closed after registry is created. At this point if the errs/warnings metric
+		// is enabled we flush counts of errors/warnings we collected before the registry was created.
+		// This is a hack to ensure that errors/warnings collected in the pre hive initialization
+		// phase are emitted as metrics.
+		// Because the ErrorsWarnings metric is a counter, this means that the rate of these errors won't be
+		// accurate, however init errors can only happen during initialization so it probably doesn't make
+		// a big difference in practice.
+		<-metricsInitialized
+		metricsInitialized = nil
+		ErrorsWarnings.WithLabelValues(logrus.ErrorLevel.String(), "init").Add(float64(lh.errs.Load()))
+		ErrorsWarnings.WithLabelValues(logrus.WarnLevel.String(), "init").Add(float64(lh.warn.Load()))
+	}()
+	return lh
 }
 
 // Levels returns the list of logging levels on which the hook is triggered.
@@ -76,8 +81,16 @@ func (h *LoggingHook) Fire(entry *logrus.Entry) error {
 		return fmt.Errorf("type of the 'subsystem' log entry field is not string but %s", reflect.TypeOf(iSubsystem))
 	}
 
+	// We count errors/warnings outside of the prometheus metric.
+	switch entry.Level {
+	case logrus.ErrorLevel:
+		h.errs.Add(1)
+	case logrus.WarnLevel:
+		h.warn.Add(1)
+	}
+
 	// Increment the metric.
-	h.metric.WithLabelValues(entry.Level.String(), subsystem).Inc()
+	ErrorsWarnings.WithLabelValues(entry.Level.String(), subsystem).Inc()
 
 	return nil
 }

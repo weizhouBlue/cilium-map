@@ -1,40 +1,27 @@
-// Copyright 2016-2019 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
-// +build linux
+//go:build linux
 
 package bpf
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/cilium/cilium/pkg/components"
 	"github.com/cilium/cilium/pkg/defaults"
 	"github.com/cilium/cilium/pkg/mountinfo"
-
-	"golang.org/x/sys/unix"
 )
 
 var (
 	// Path to where bpffs is mounted
-	mapRoot = defaults.DefaultMapRoot
-
-	// Prefix for all maps (default: tc/globals)
-	mapPrefix = defaults.DefaultMapPrefix
+	bpffsRoot = defaults.BPFFSRoot
 
 	// Set to true on first get request to detect misorder
 	lockedDown      = false
@@ -47,24 +34,47 @@ func lockDown() {
 	lockedDown = true
 }
 
-func setMapRoot(path string) {
+func setBPFFSRoot(path string) {
 	if lockedDown {
-		panic("setMapRoot() call after MapRoot was read")
+		panic("setBPFFSRoot() call after bpffsRoot was read")
 	}
-	mapRoot = path
+	bpffsRoot = path
 }
 
-func GetMapRoot() string {
+func BPFFSRoot() string {
 	once.Do(lockDown)
-	return mapRoot
+	return bpffsRoot
 }
 
-func MapPrefixPath() string {
+// TCGlobalsPath returns the absolute path to <bpffs>/tc/globals, used for
+// legacy map pin paths.
+func TCGlobalsPath() string {
 	once.Do(lockDown)
-	return filepath.Join(mapRoot, mapPrefix)
+	return filepath.Join(bpffsRoot, defaults.TCGlobalsPath)
 }
 
-func mapPathFromMountInfo(name string) string {
+// CiliumPath returns the bpffs path to be used for Cilium object pins.
+func CiliumPath() string {
+	once.Do(lockDown)
+	return filepath.Join(bpffsRoot, "cilium")
+}
+
+// MkdirBPF wraps [os.MkdirAll] with the right permission bits for bpffs.
+// Use this for ensuring the existence of directories on bpffs.
+func MkdirBPF(path string) error {
+	return os.MkdirAll(path, 0755)
+}
+
+// Remove path ignoring ErrNotExist.
+func Remove(path string) error {
+	err := os.RemoveAll(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("removing bpffs directory at %s: %w", path, err)
+	}
+	return err
+}
+
+func tcPathFromMountInfo(name string) string {
 	readMountInfo.Do(func() {
 		mountInfos, err := mountinfo.GetMountInfo()
 		if err != nil {
@@ -73,7 +83,7 @@ func mapPathFromMountInfo(name string) string {
 
 		for _, mountInfo := range mountInfos {
 			if mountInfo.FilesystemType == "bpf" {
-				mountInfoPrefix = filepath.Join(mountInfo.MountPoint, mapPrefix)
+				mountInfoPrefix = filepath.Join(mountInfo.MountPoint, defaults.TCGlobalsPath)
 				return
 			}
 		}
@@ -88,9 +98,9 @@ func mapPathFromMountInfo(name string) string {
 func MapPath(name string) string {
 	if components.IsCiliumAgent() {
 		once.Do(lockDown)
-		return filepath.Join(mapRoot, mapPrefix, name)
+		return filepath.Join(TCGlobalsPath(), name)
 	}
-	return mapPathFromMountInfo(name)
+	return tcPathFromMountInfo(name)
 }
 
 // LocalMapName returns the name for a BPF map that is local to the specified ID.
@@ -101,16 +111,6 @@ func LocalMapName(name string, id uint16) string {
 // LocalMapPath returns the path for a BPF map that is local to the specified ID.
 func LocalMapPath(name string, id uint16) string {
 	return MapPath(LocalMapName(name, id))
-}
-
-// Environment returns a list of environment variables which are needed to make
-// BPF programs and tc aware of the actual BPFFS mount path.
-func Environment() []string {
-	return append(
-		os.Environ(),
-		fmt.Sprintf("CILIUM_BPF_MNT=%s", GetMapRoot()),
-		fmt.Sprintf("TC_BPF_MNT=%s", GetMapRoot()),
-	)
 }
 
 var (
@@ -127,24 +127,24 @@ func mountFS(printWarning bool) error {
 		log.Warning("====================================================================================")
 	}
 
-	log.Infof("Mounting BPF filesystem at %s", mapRoot)
+	log.Infof("Mounting BPF filesystem at %s", bpffsRoot)
 
-	mapRootStat, err := os.Stat(mapRoot)
+	mapRootStat, err := os.Stat(bpffsRoot)
 	if err != nil {
 		if os.IsNotExist(err) {
-			if err := os.MkdirAll(mapRoot, 0755); err != nil {
-				return fmt.Errorf("unable to create bpf mount directory: %s", err)
+			if err := MkdirBPF(bpffsRoot); err != nil {
+				return fmt.Errorf("unable to create bpf mount directory: %w", err)
 			}
 		} else {
-			return fmt.Errorf("failed to stat the mount path %s: %s", mapRoot, err)
+			return fmt.Errorf("failed to stat the mount path %s: %w", bpffsRoot, err)
 
 		}
 	} else if !mapRootStat.IsDir() {
-		return fmt.Errorf("%s is a file which is not a directory", mapRoot)
+		return fmt.Errorf("%s is a file which is not a directory", bpffsRoot)
 	}
 
-	if err := unix.Mount(mapRoot, mapRoot, "bpf", 0, ""); err != nil {
-		return fmt.Errorf("failed to mount %s: %s", mapRoot, err)
+	if err := unix.Mount(bpffsRoot, bpffsRoot, "bpf", 0, ""); err != nil {
+		return fmt.Errorf("failed to mount %s: %w", bpffsRoot, err)
 	}
 	return nil
 }
@@ -159,7 +159,7 @@ func hasMultipleMounts() (bool, error) {
 	}
 
 	for _, mountInfo := range mountInfos {
-		if mountInfo.Root == "/" && mountInfo.MountPoint == mapRoot {
+		if mountInfo.Root == "/" && mountInfo.MountPoint == bpffsRoot {
 			num++
 		}
 	}
@@ -169,8 +169,8 @@ func hasMultipleMounts() (bool, error) {
 
 // checkOrMountCustomLocation tries to check or mount the BPF filesystem in the
 // given path.
-func checkOrMountCustomLocation(bpfRoot string, printWarning bool) error {
-	setMapRoot(bpfRoot)
+func checkOrMountCustomLocation(bpfRoot string) error {
+	setBPFFSRoot(bpfRoot)
 
 	// Check whether the custom location has a BPFFS mount.
 	mounted, bpffsInstance, err := mountinfo.IsMountFS(mountinfo.FilesystemTypeBPFFS, bpfRoot)
@@ -180,8 +180,8 @@ func checkOrMountCustomLocation(bpfRoot string, printWarning bool) error {
 
 	// If the custom location has no mount, let's mount BPFFS there.
 	if !mounted {
-		setMapRoot(bpfRoot)
-		if err := mountFS(printWarning); err != nil {
+		setBPFFSRoot(bpfRoot)
+		if err := mountFS(true); err != nil {
 			return err
 		}
 
@@ -194,7 +194,7 @@ func checkOrMountCustomLocation(bpfRoot string, printWarning bool) error {
 		return fmt.Errorf("mount in the custom directory %s has a different filesystem than BPFFS", bpfRoot)
 	}
 
-	log.Infof("Detected mounted BPF filesystem at %s", mapRoot)
+	log.Infof("Detected mounted BPF filesystem at %s", bpffsRoot)
 
 	return nil
 }
@@ -204,16 +204,16 @@ func checkOrMountCustomLocation(bpfRoot string, printWarning bool) error {
 // - /sys/fs/bpf
 // - /run/cilium/bpffs
 // There is a procedure of determining which directory is going to be used:
-// 1. Checking whether BPFFS filesystem is mounted in /sys/fs/bpf.
-// 2. If there is no mount, then mount BPFFS in /sys/fs/bpf and finish there.
-// 3. If there is a BPFFS mount, finish there.
-// 4. If there is a mount, but with the other filesystem, then it means that most
-//    probably Cilium is running inside container which has mounted /sys/fs/bpf
-//    from host, but host doesn't have proper BPFFS mount, so that mount is just
-//    the empty directory. In that case, mount BPFFS under /run/cilium/bpffs.
-func checkOrMountDefaultLocations(printWarning bool) error {
+//  1. Checking whether BPFFS filesystem is mounted in /sys/fs/bpf.
+//  2. If there is no mount, then mount BPFFS in /sys/fs/bpf and finish there.
+//  3. If there is a BPFFS mount, finish there.
+//  4. If there is a mount, but with the other filesystem, then it means that most
+//     probably Cilium is running inside container which has mounted /sys/fs/bpf
+//     from host, but host doesn't have proper BPFFS mount, so that mount is just
+//     the empty directory. In that case, mount BPFFS under /run/cilium/bpffs.
+func checkOrMountDefaultLocations() error {
 	// Check whether /sys/fs/bpf has a BPFFS mount.
-	mounted, bpffsInstance, err := mountinfo.IsMountFS(mountinfo.FilesystemTypeBPFFS, mapRoot)
+	mounted, bpffsInstance, err := mountinfo.IsMountFS(mountinfo.FilesystemTypeBPFFS, bpffsRoot)
 	if err != nil {
 		return err
 	}
@@ -221,7 +221,7 @@ func checkOrMountDefaultLocations(printWarning bool) error {
 	// If /sys/fs/bpf is not mounted at all, we should mount
 	// BPFFS there.
 	if !mounted {
-		if err := mountFS(printWarning); err != nil {
+		if err := mountFS(false); err != nil {
 			return err
 		}
 
@@ -242,35 +242,35 @@ func checkOrMountDefaultLocations(printWarning bool) error {
 			"in %s. However, it probably means that Cilium is running "+
 			"inside container and BPFFS is not mounted on the host. "+
 			"for more information, see: https://cilium.link/err-bpf-mount",
-			defaults.DefaultMapRootFallback,
+			defaults.BPFFSRootFallback,
 		)
-		setMapRoot(defaults.DefaultMapRootFallback)
+		setBPFFSRoot(defaults.BPFFSRootFallback)
 
-		cMounted, cBpffsInstance, err := mountinfo.IsMountFS(mountinfo.FilesystemTypeBPFFS, mapRoot)
+		cMounted, cBpffsInstance, err := mountinfo.IsMountFS(mountinfo.FilesystemTypeBPFFS, bpffsRoot)
 		if err != nil {
 			return err
 		}
 		if !cMounted {
-			if err := mountFS(printWarning); err != nil {
+			if err := mountFS(false); err != nil {
 				return err
 			}
 		} else if !cBpffsInstance {
-			log.Fatalf("%s is mounted but has a different filesystem than BPFFS", defaults.DefaultMapRootFallback)
+			log.Fatalf("%s is mounted but has a different filesystem than BPFFS", defaults.BPFFSRootFallback)
 		}
 	}
 
-	log.Infof("Detected mounted BPF filesystem at %s", mapRoot)
+	log.Infof("Detected mounted BPF filesystem at %s", bpffsRoot)
 
 	return nil
 }
 
-func checkOrMountFS(bpfRoot string, printWarning bool) error {
+func checkOrMountFS(bpfRoot string) error {
 	if bpfRoot == "" {
-		if err := checkOrMountDefaultLocations(printWarning); err != nil {
+		if err := checkOrMountDefaultLocations(); err != nil {
 			return err
 		}
 	} else {
-		if err := checkOrMountCustomLocation(bpfRoot, printWarning); err != nil {
+		if err := checkOrMountCustomLocation(bpfRoot); err != nil {
 			return err
 		}
 	}
@@ -280,7 +280,7 @@ func checkOrMountFS(bpfRoot string, printWarning bool) error {
 		return err
 	}
 	if multipleMounts {
-		return fmt.Errorf("multiple mount points detected at %s", mapRoot)
+		return fmt.Errorf("multiple mount points detected at %s", bpffsRoot)
 	}
 
 	return nil
@@ -292,9 +292,9 @@ func checkOrMountFS(bpfRoot string, printWarning bool) error {
 //
 // If printWarning is set, will print a warning if bpffs has not previously been
 // mounted.
-func CheckOrMountFS(bpfRoot string, printWarning bool) {
+func CheckOrMountFS(bpfRoot string) {
 	mountOnce.Do(func() {
-		if err := checkOrMountFS(bpfRoot, printWarning); err != nil {
+		if err := checkOrMountFS(bpfRoot); err != nil {
 			log.WithError(err).Fatal("Unable to mount BPF filesystem")
 		}
 	})

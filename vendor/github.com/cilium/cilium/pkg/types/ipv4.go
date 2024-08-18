@@ -1,28 +1,26 @@
-// Copyright 2016-2019 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package types
 
 import (
 	"net"
+	"net/netip"
 )
 
 // IPv4 is the binary representation for encoding in binary structs.
 type IPv4 [4]byte
 
+func (v4 IPv4) IsZero() bool {
+	return v4[0] == 0 && v4[1] == 0 && v4[2] == 0 && v4[3] == 0
+}
+
 func (v4 IPv4) IP() net.IP {
 	return v4[:]
+}
+
+func (v4 IPv4) Addr() netip.Addr {
+	return netip.AddrFrom4(v4)
 }
 
 func (v4 IPv4) String() string {
@@ -32,5 +30,16 @@ func (v4 IPv4) String() string {
 // DeepCopyInto is a deepcopy function, copying the receiver, writing into out. in must be non-nil.
 func (v4 *IPv4) DeepCopyInto(out *IPv4) {
 	copy(out[:], v4[:])
-	return
+}
+
+// FromAddr will populate the receiver with the specified address if and only
+// if the provided address is a valid IPv4 address. Any other address,
+// including the "invalid ip" value netip.Addr{} will zero the receiver.
+func (v4 *IPv4) FromAddr(addr netip.Addr) {
+	if addr.Is4() {
+		a := IPv4(addr.As4())
+		copy(v4[:], a[:])
+	} else {
+		clear(v4[:])
+	}
 }

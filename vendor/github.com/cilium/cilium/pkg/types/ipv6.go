@@ -1,21 +1,11 @@
-// Copyright 2016-2019 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package types
 
 import (
 	"net"
+	"net/netip"
 )
 
 // IPv6 is the binary representation for encoding in binary structs.
@@ -25,6 +15,10 @@ func (v6 IPv6) IP() net.IP {
 	return v6[:]
 }
 
+func (v6 IPv6) Addr() netip.Addr {
+	return netip.AddrFrom16(v6)
+}
+
 func (v6 IPv6) String() string {
 	return v6.IP().String()
 }
@@ -32,5 +26,16 @@ func (v6 IPv6) String() string {
 // DeepCopyInto is a deepcopy function, copying the receiver, writing into out. in must be non-nil.
 func (v6 *IPv6) DeepCopyInto(out *IPv6) {
 	copy(out[:], v6[:])
-	return
+}
+
+// FromAddr will populate the receiver with the specified address if and only
+// if the provided address is a valid IPv6 address. Any other address,
+// including the "invalid ip" value netip.Addr{} will zero the receiver.
+func (v6 *IPv6) FromAddr(addr netip.Addr) {
+	if addr.Is6() {
+		a := IPv6(addr.As16())
+		copy(v6[:], a[:])
+	} else {
+		clear(v6[:])
+	}
 }

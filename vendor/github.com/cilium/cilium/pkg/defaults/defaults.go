@@ -1,16 +1,5 @@
-// Copyright 2016-2020 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package defaults
 
@@ -20,7 +9,13 @@ import (
 
 const (
 	// AgentHealthPort is the default value for option.AgentHealthPort
-	AgentHealthPort = 9876
+	AgentHealthPort = 9879
+
+	// ClusterHealthPort is the default value for option.ClusterHealthPort
+	ClusterHealthPort = 4240
+
+	// ClusterMeshHealthPort is the default value for option.ClusterMeshHealthPort
+	ClusterMeshHealthPort = 80
 
 	// GopsPortAgent is the default value for option.GopsPort in the agent
 	GopsPortAgent = 9890
@@ -31,11 +26,20 @@ const (
 	// GopsPortApiserver is the default value for option.GopsPort in the apiserver
 	GopsPortApiserver = 9892
 
+	// GopsPortKVStoreMesh is the default value for option.GopsPort in kvstoremesh
+	GopsPortKVStoreMesh = 9894
+
 	// IPv6ClusterAllocCIDR is the default value for option.IPv6ClusterAllocCIDR
 	IPv6ClusterAllocCIDR = IPv6ClusterAllocCIDRBase + "/64"
 
 	// IPv6ClusterAllocCIDRBase is the default base for IPv6ClusterAllocCIDR
 	IPv6ClusterAllocCIDRBase = "f00d::"
+
+	// IPv6NAT46x64CIDR is the default prefix for NAT46x64 gateway
+	IPv6NAT46x64CIDR = IPv6NAT46x64CIDRBase + "/96"
+
+	// IPv6NAT46x64CIDRBase is the default base for IPv6NAT46x64CIDR
+	IPv6NAT46x64CIDRBase = "64:ff9b::"
 
 	// RuntimePath is the default path to the runtime directory
 	RuntimePath = "/var/run/cilium"
@@ -52,8 +56,9 @@ const (
 	// TemplatesDir is the default path for the compiled template objects relative to StateDir
 	TemplatesDir = "templates"
 
-	// TemplatePath is the default path for a symlink to a template relative to StateDir/<EPID>
-	TemplatePath = "template.o"
+	// TemplateIDPath is the name of a file which contains the ID (aka hash) of
+	// the template used by the endpoint.
+	TemplateIDPath = "template.txt"
 
 	// BpfDir is the default path for template files relative to LibDir
 	BpfDir = "bpf"
@@ -75,6 +80,36 @@ const (
 	// HubbleSockPath.
 	HubbleSockPathEnv = "HUBBLE_SOCK"
 
+	// HubbleRecorderStoragePath specifies the directory in which pcap files
+	// created via the Hubble Recorder API are stored
+	HubbleRecorderStoragePath = RuntimePath + "/pcaps"
+
+	// HubbleRecorderSinkQueueSize is the queue size for each recorder sink
+	HubbleRecorderSinkQueueSize = 1024
+
+	// HubbleRedactEnabled controls if sensitive information will be redacted from L7 flows
+	HubbleRedactEnabled = false
+
+	// HubbleRedactHttpURLQuery controls if the URL query will be redacted from flows
+	HubbleRedactHttpURLQuery = false
+
+	// HubbleRedactHttpUserInfo controls if the user info will be redacted from flows
+	HubbleRedactHttpUserInfo = true
+
+	// HubbleRedactKafkaApiKey controls if the Kafka API key will be redacted from flows
+	HubbleRedactKafkaApiKey = false
+
+	// HubbleDropEventsEnabled controls whether Hubble should create v1.Events
+	// for packet drops related to pods
+	HubbleDropEventsEnabled = false
+
+	// HubbleDropEventsInterval controls the minimum time between emitting events
+	// with the same source and destination IP
+	HubbleDropEventsInterval = 2 * time.Minute
+
+	// HubbleDropEventsReasons controls which drop reasons to emit events for
+	HubbleDropEventsReasons = "auth_required,policy_denied"
+
 	// MonitorSockPath1_2 is the path to the UNIX domain socket used to
 	// distribute BPF and agent events to listeners.
 	// This is the 1.2 protocol version.
@@ -83,33 +118,38 @@ const (
 	// PidFilePath is the path to the pid file for the agent.
 	PidFilePath = RuntimePath + "/cilium.pid"
 
-	// EnableHostIPRestore controls whether the host IP should be restored
-	// from previous state automatically
-	EnableHostIPRestore = true
+	// DeletionQueueDir is the directory used for the CNI plugin to queue deletion requests
+	// if the agent is down
+	DeleteQueueDir = RuntimePath + "/deleteQueue"
 
-	// DefaultMapRoot is the default path where BPFFS should be mounted
-	DefaultMapRoot = "/sys/fs/bpf"
+	// DeleteQueueLockfile is the file used to synchronize access of the queue directory between
+	// the agent and the CNI plugin processes
+	DeleteQueueLockfile = DeleteQueueDir + "/lockfile"
+
+	// BPFFSRoot is the default path where BPFFS should be mounted
+	BPFFSRoot = "/sys/fs/bpf"
+
+	// BPFFSRootFallback is the path which is used when /sys/fs/bpf has
+	// a mount, but with the other filesystem than BPFFS.
+	BPFFSRootFallback = "/run/cilium/bpffs"
+
+	// TCGlobalsPath is the default prefix for all BPF maps.
+	TCGlobalsPath = "tc/globals"
 
 	// DefaultCgroupRoot is the default path where cilium cgroup2 should be mounted
-	DefaultCgroupRoot = "/var/run/cilium/cgroupv2"
-
-	// SockopsEnable controsl whether sockmap should be used
-	SockopsEnable = false
-
-	// DefaultMapRootFallback is the path which is used when /sys/fs/bpf has
-	// a mount, but with the other filesystem than BPFFS.
-	DefaultMapRootFallback = "/run/cilium/bpffs"
-
-	// DefaultMapPrefix is the default prefix for all BPF maps.
-	DefaultMapPrefix = "tc/globals"
+	DefaultCgroupRoot = "/run/cilium/cgroupv2"
 
 	// DNSMaxIPsPerRestoredRule defines the maximum number of IPs to maintain
 	// for each FQDN selector in endpoint's restored DNS rules.
 	DNSMaxIPsPerRestoredRule = 1000
 
+	// FFQDNRegexCompileLRUSize defines the maximum size for the FQDN regex
+	// compilation LRU used by the DNS proxy and policy validation.
+	FQDNRegexCompileLRUSize = 1024
+
 	// ToFQDNsMinTTL is the default lower bound for TTLs used with ToFQDNs rules.
 	// This is used in DaemonConfig.Populate
-	ToFQDNsMinTTL = 3600 // 1 hour in seconds
+	ToFQDNsMinTTL = 0
 
 	// ToFQDNsMaxIPsPerHost defines the maximum number of IPs to maintain
 	// for each FQDN name in an endpoint's FQDN cache
@@ -118,6 +158,16 @@ const (
 	// ToFQDNsMaxDeferredConnectionDeletes Maximum number of IPs to retain for
 	// expired DNS lookups with still-active connections
 	ToFQDNsMaxDeferredConnectionDeletes = 10000
+
+	// ToFQDNsIdleConnectionGracePeriod Time during which idle but
+	// previously active connections with expired DNS lookups are
+	// still considered alive
+	ToFQDNsIdleConnectionGracePeriod = 0 * time.Second
+
+	// FQDNProxyResponseMaxDelay The maximum time the DNS proxy holds an allowed
+	// DNS response before sending it along. Responses are sent as soon as the
+	//datapath is updated with the new IP information.
+	FQDNProxyResponseMaxDelay = 100 * time.Millisecond
 
 	// ToFQDNsPreCache is a path to a file with DNS cache data to insert into the
 	// global cache on startup.
@@ -128,12 +178,39 @@ const (
 	// endpoints that are larger than 512 Bytes or the EDNS0 option, if present.
 	ToFQDNsEnableDNSCompression = true
 
+	// DNSProxyEnableTransparentMode enables transparent mode for the DNS proxy.
+	DNSProxyEnableTransparentMode = false
+
+	// DNSProxyLockCount is the default array size containing mutexes which protect
+	// against parallel handling of DNS response names.
+	DNSProxyLockCount = 131
+
+	// DNSProxyLockTimeout is the default timeout when acquiring the locks controlled by
+	// DNSProxyLockCount.
+	DNSProxyLockTimeout = 500 * time.Millisecond
+
+	// DNSProxySocketLingerTimeout defines how many seconds we wait for the connection
+	// between the DNS proxy and the upstream server to be closed.
+	DNSProxySocketLingerTimeout = 10
+
 	// IdentityChangeGracePeriod is the default value for
 	// option.IdentityChangeGracePeriod
 	IdentityChangeGracePeriod = 5 * time.Second
 
+	// IdentityRestoreGracePeriodKvstore is the default value for
+	// option.IdentityRestoreGracePeriod when kvstore is enabled.
+	IdentityRestoreGracePeriodKvstore = 10 * time.Minute
+
+	// IdentityRestoreGracePeriodKvstore is the default value for
+	// option.IdentityRestoreGracePeriod when only k8s is in use
+	IdentityRestoreGracePeriodK8s = 30 * time.Second
+
 	// ExecTimeout is a timeout for executing commands.
 	ExecTimeout = 300 * time.Second
+
+	// MaxInternalTimerDelay does not enforce a maximum on timer values in
+	// the agent by default.
+	MaxInternalTimerDelay = 0 * time.Second
 
 	// StatusCollectorInterval is the interval between a probe invocations
 	StatusCollectorInterval = 5 * time.Second
@@ -155,17 +232,20 @@ const (
 	// EnableIPv6NDP is the default value for IPv6 NDP support enablement
 	EnableIPv6NDP = false
 
+	// EnableSRv6 is the default value for the SRv6 support enablement.
+	EnableSRv6 = false
+
+	// SRv6EncapMode is the encapsulation mode for SRv6.
+	SRv6EncapMode = "reduced"
+
+	// EnableSCTP is the default value for SCTP support enablement
+	EnableSCTP = false
+
 	// EnableL7Proxy is the default value for L7 proxy enablement
 	EnableL7Proxy = true
 
 	// EnableHostLegacyRouting is the default value for using the old routing path via stack.
 	EnableHostLegacyRouting = false
-
-	// EnableExternalIPs is the default value for k8s service with externalIPs feature.
-	EnableExternalIPs = true
-
-	// K8sEnableEndpointSlice is the default value for k8s EndpointSlice feature.
-	K8sEnableEndpointSlice = true
 
 	// PreAllocateMaps is the default value for BPF map preallocation
 	PreAllocateMaps = true
@@ -173,9 +253,30 @@ const (
 	// EnableIPSec is the default value for IPSec enablement
 	EnableIPSec = false
 
+	// IPsecKeyRotationDuration is the time to wait before removing old keys when
+	// the IPsec key is changing.
+	IPsecKeyRotationDuration = 5 * time.Minute
+
+	// Enable watcher for IPsec key. If disabled, a restart of the agent will
+	// be necessary on key rotations.
+	EnableIPsecKeyWatcher = true
+
+	// Enable caching for XfrmState for IPSec. Significantly reduces CPU usage
+	// in large clusters.
+	EnableIPSecXfrmStateCaching = true
+
+	// Enable IPSec encrypted overlay
+	//
+	// This feature will encrypt overlay traffic before it leaves the cluster.
+	EnableIPSecEncryptedOverlay = false
+
 	// EncryptNode enables encrypting traffic from host networking applications
 	// which are not part of Cilium manged pods.
 	EncryptNode = false
+
+	// NodeEncryptionOptOutLabels contains the label selectors for nodes opting out of
+	// node-to-node encryption
+	NodeEncryptionOptOutLabels = "node-role.kubernetes.io/control-plane"
 
 	// MonitorQueueSizePerCPU is the default value for the monitor queue
 	// size per CPU
@@ -208,6 +309,9 @@ const (
 	// EnableAutoDirectRouting is the default value for EnableAutoDirectRouting
 	EnableAutoDirectRouting = false
 
+	// EnableDirectRoutingSkipUnreachable is the default value for EnableDirectRoutingIgnoreUnreachableName
+	EnableDirectRoutingSkipUnreachable = false
+
 	// EnableHealthChecking is the default value for EnableHealthChecking
 	EnableHealthChecking = true
 
@@ -218,6 +322,10 @@ const (
 	// EnableHealthCheckNodePort is the default value for
 	// EnableHealthCheckNodePort
 	EnableHealthCheckNodePort = true
+
+	// EnableHealthCheckLoadBalancerIP is the default value for
+	// EnableHealthCheckLoadBalancerIP
+	EnableHealthCheckLoadBalancerIP = false
 
 	// AlignCheckerName is the BPF object name for the alignchecker.
 	AlignCheckerName = "bpf_alignchecker.o"
@@ -232,9 +340,6 @@ const (
 	// a kvstore path for too long.
 	KVStoreStaleLockTimeout = 30 * time.Second
 
-	// IPAllocationTimeout is the timeout when allocating CIDRs
-	IPAllocationTimeout = 2 * time.Minute
-
 	// PolicyQueueSize is the default queue size for policy-related events.
 	PolicyQueueSize = 100
 
@@ -244,13 +349,13 @@ const (
 	// EndpointQueueSize is the default queue size for an endpoint.
 	EndpointQueueSize = 25
 
-	// SelectiveRegeneration specifies whether regeneration of endpoints will be
-	// invoked only for endpoints which are selected by policy changes.
-	SelectiveRegeneration = true
-
-	// K8sSyncTimeout specifies the standard time to allow for synchronizing
-	// local caches with Kubernetes state before exiting.
+	// K8sSyncTimeout specifies the default time to wait after the last event
+	// of a Kubernetes resource type before timing out while waiting for synchronization.
 	K8sSyncTimeout = 3 * time.Minute
+
+	// AllocatorListTimeout specifies the standard time to allow for listing
+	// initial allocator state from kvstore before exiting.
+	AllocatorListTimeout = 3 * time.Minute
 
 	// K8sWatcherEndpointSelector specifies the k8s endpoints that Cilium
 	// should watch for.
@@ -259,9 +364,6 @@ const (
 	// ConntrackGCMaxLRUInterval is the maximum conntrack GC interval when using LRU maps
 	ConntrackGCMaxLRUInterval = 12 * time.Hour
 
-	// ConntrackGCMaxInterval is the maximum conntrack GC interval for non-LRU maps
-	ConntrackGCMaxInterval = 30 * time.Minute
-
 	// ConntrackGCMinInterval is the minimum conntrack GC interval
 	ConntrackGCMinInterval = 10 * time.Second
 
@@ -269,32 +371,17 @@ const (
 	// connection tracking garbage collection
 	ConntrackGCStartingInterval = 5 * time.Minute
 
-	// K8sEventHandover enables use of the kvstore to optimize Kubernetes
-	// event handling by listening for k8s events in the operator and
-	// mirroring it into the kvstore for reduced overhead in large
-	// clusters.
-	K8sEventHandover = false
-
 	// LoopbackIPv4 is the default address for service loopback
 	LoopbackIPv4 = "169.254.42.1"
-
-	// EndpointInterfaceNamePrefix is the default prefix name of the
-	// interface names shared by all endpoints
-	EndpointInterfaceNamePrefix = "lxc+"
-
-	// ForceLocalPolicyEvalAtSource is the default value for
-	// option.ForceLocalPolicyEvalAtSource. It is enabled by default to
-	// provide backwards compatibility, it can be disabled via an option
-	ForceLocalPolicyEvalAtSource = true
 
 	// EnableEndpointRoutes is the value for option.EnableEndpointRoutes.
 	// It is disabled by default for backwards compatibility.
 	EnableEndpointRoutes = false
 
 	// AnnotateK8sNode is the default value for option.AnnotateK8sNode. It is
-	// enabled by default to annotate kubernetes node and can be disabled using
+	// disabled by default to annotate kubernetes node and can be enabled using
 	// the provided option.
-	AnnotateK8sNode = true
+	AnnotateK8sNode = false
 
 	// MonitorBufferPages is the default number of pages to use for the
 	// ring buffer interacting with the kernel
@@ -307,6 +394,10 @@ const (
 
 	// KVstoreLeaseTTL is the time-to-live of the kvstore lease.
 	KVstoreLeaseTTL = 15 * time.Minute
+
+	// KVstoreMaxConsecutiveQuorumErrors is the maximum number of acceptable
+	// kvstore consecutive quorum errors before the agent assumes permanent failure
+	KVstoreMaxConsecutiveQuorumErrors = 2
 
 	// KVstoreKeepAliveIntervalFactor is the factor to calculate the interval
 	// from KVstoreLeaseTTL in which KVstore lease is being renewed.
@@ -323,18 +414,48 @@ const (
 	// CiliumNode.Spec.IPAM.PreAllocate if no value is set
 	IPAMPreAllocation = 8
 
+	// IPAMDefaultIPPool is the default value for the multi-pool default pool name.
+	IPAMDefaultIPPool = "default"
+
 	// ENIFirstInterfaceIndex is the default value for
-	// CiliumNode.Spec.ENI.FirstInterfaceIndex if no value is set
-	ENIFirstInterfaceIndex = 1
+	// CiliumNode.Spec.ENI.FirstInterfaceIndex if no value is set.
+	ENIFirstInterfaceIndex = 0
+
+	// UseENIPrimaryAddress is the default value for
+	// CiliumNode.Spec.ENI.UsePrimaryAddress if no value is set.
+	UseENIPrimaryAddress = false
+
+	// ENIDisableNodeLevelPD  is the default value for
+	// CiliumNode.Spec.ENI.DisablePrefixDelegation if no value is set.
+	ENIDisableNodeLevelPD = false
+
+	// ENIGarbageCollectionTagManagedName is part of the ENIGarbageCollectionTags default tag set
+	ENIGarbageCollectionTagManagedName = "io.cilium/cilium-managed"
+
+	// ENIGarbageCollectionTagManagedValue is part of the ENIGarbageCollectionTags default tag set
+	ENIGarbageCollectionTagManagedValue = "true"
+
+	// ENIGarbageCollectionTagClusterName is part of the ENIGarbageCollectionTags default tag set
+	ENIGarbageCollectionTagClusterName = "io.cilium/cluster-name"
+
+	// ENIGarbageCollectionTagClusterValue is part of the ENIGarbageCollectionTags default tag set
+	ENIGarbageCollectionTagClusterValue = ClusterName
+
+	// ENIGarbageCollectionInterval is the default interval for the ENIGarbageCollectionInterval operator flag
+	ENIGarbageCollectionInterval = 5 * time.Minute
+
+	// ENIGarbageCollectionMaxPerInterval is the maximum number of ENIs which might be garbage collected
+	// per GC interval
+	ENIGarbageCollectionMaxPerInterval = 25
 
 	// ParallelAllocWorkers is the default max number of parallel workers doing allocation in the operator
 	ParallelAllocWorkers = 50
 
 	// IPAMAPIBurst is the default burst value when rate limiting access to external APIs
-	IPAMAPIBurst = 4
+	IPAMAPIBurst = 20
 
 	// IPAMAPIQPSLimit is the default QPS limit when rate limiting access to external APIs
-	IPAMAPIQPSLimit = 20.0
+	IPAMAPIQPSLimit = 4.0
 
 	// AutoCreateCiliumNodeResource enables automatic creation of a
 	// CiliumNode resource for the local node
@@ -344,11 +465,11 @@ const (
 	// policy updates are invoked.
 	PolicyTriggerInterval = 1 * time.Second
 
-	// K8sClientQPSLimit is the default qps for the k8s client. It is set to 0 because the the k8s client
+	// K8sClientQPSLimit is the default qps for the k8s client. It is set to 0 because the k8s client
 	// has its own default.
 	K8sClientQPSLimit float32 = 0.0
 
-	// K8sClientBurst is the default burst for the k8s client. It is set to 0 because the the k8s client
+	// K8sClientBurst is the default burst for the k8s client. It is set to 0 because the k8s client
 	// has its own default.
 	K8sClientBurst = 0
 
@@ -375,9 +496,6 @@ const (
 	// specified in the L7 policies.
 	CertsDirectory = RuntimePath + "/certs"
 
-	// EnableRemoteNodeIdentity is the default value for option.EnableRemoteNodeIdentity
-	EnableRemoteNodeIdentity = false
-
 	// IPAMExpiration is the timeout after which an IP subject to expiratio
 	// is being released again if no endpoint is being created in time.
 	IPAMExpiration = 10 * time.Minute
@@ -390,13 +508,18 @@ const (
 	// the map used to track datagram fragments.
 	FragmentsMapEntries = 8192
 
-	// K8sEnableAPIDiscovery defines whether Kuberntes API groups and
+	// K8sEnableAPIDiscovery defines whether Kubernetes API groups and
 	// resources should be probed using the discovery API
 	K8sEnableAPIDiscovery = false
 
 	// EnableIdentityMark enables setting identity in mark field of packet
 	// for local traffic
 	EnableIdentityMark = true
+
+	// EnableHighScaleIPcache enables the special ipcache mode for high scale
+	// clusters. The ipcache content will be reduced to the strict minimum and
+	// traffic will be encapsulated to carry security identities.
+	EnableHighScaleIPcache = false
 
 	// K8sEnableLeasesFallbackDiscovery enables k8s to fallback to API probing to check
 	// for the support of Leases in Kubernetes when there is an error in discovering
@@ -405,4 +528,107 @@ const (
 
 	// KubeProxyReplacementHealthzBindAddr is the default kubeproxyReplacement healthz server bind addr
 	KubeProxyReplacementHealthzBindAddr = ""
+
+	// InstallNoConntrackRules instructs Cilium to install Iptables rules to skip netfilter connection tracking on all pod traffic.
+	InstallNoConntrackIptRules = false
+
+	// ContainerIPLocalReservedPortsAuto instructs the Cilium CNI plugin to reserve
+	// an auto-generated list of ports in the container network namespace
+	ContainerIPLocalReservedPortsAuto = "auto"
+
+	// ExternalClusterIP enables cluster external access to ClusterIP services.
+	// Defaults to false to retain prior behaviour of not routing external packets to ClusterIPs.
+	ExternalClusterIP = false
+
+	// EnableICMPRules enables ICMP-based rule support for Cilium Network Policies.
+	EnableICMPRules = true
+
+	// RoutingMode enables choosing between native routing mode or tunneling mode.
+	RoutingMode = "tunnel"
+
+	// TunnelProtocol is the default tunneling protocol
+	TunnelProtocol = "vxlan"
+
+	// ServiceNoBackendResponse is the default response for services without backends
+	ServiceNoBackendResponse = "reject"
+
+	// Use the CiliumInternalIPs (vs. NodeInternalIPs) for IPsec encapsulation.
+	UseCiliumInternalIPForIPsec = false
+
+	// TunnelPortVXLAN is the default VXLAN port
+	TunnelPortVXLAN uint16 = 8472
+	// TunnelPortGeneve is the default Geneve port
+	TunnelPortGeneve uint16 = 6081
+
+	// ARPBaseReachableTime resembles the kernel's NEIGH_VAR_BASE_REACHABLE_TIME which defaults to 30 seconds.
+	ARPBaseReachableTime = 30 * time.Second
+
+	// EnableVTEP enables VXLAN Tunnel Endpoint (VTEP) Integration
+	EnableVTEP     = false
+	MaxVTEPDevices = 8
+
+	// Enable BGP control plane features.
+	EnableBGPControlPlane = false
+
+	// EnableK8sNetworkPolicy enables support for K8s NetworkPolicy.
+	EnableK8sNetworkPolicy = true
+
+	// MaxConnectedClusters sets the maximum number of clusters that can be
+	// connected in a clustermesh.
+	// The value is used to determine the bit allocation for cluster ID and
+	// identity in a numeric identity. Values > 255 will decrease the number of
+	// allocatable identities.
+	MaxConnectedClusters = 255
+
+	// EnableNodeSelectorLabels is the default value for option.EnableNodeSelectorLabels
+	EnableNodeSelectorLabels = false
+
+	// BPFEventsDropEnabled controls whether the Cilium datapath exposes "drop" events to Cilium monitor and Hubble.
+	BPFEventsDropEnabled = true
+
+	// BPFEventsPolicyVerdictEnabled controls whether the Cilium datapath exposes "policy verdict" events to Cilium monitor and Hubble.
+	BPFEventsPolicyVerdictEnabled = true
+
+	// BPFEventsTraceEnabled controls whether the Cilium datapath exposes "trace" events to Cilium monitor and Hubble.
+	BPFEventsTraceEnabled = true
+
+	// EnableEnvoyConfig is the default value for option.EnableEnvoyConfig
+	EnableEnvoyConfig = false
+
+	// NetNsPath is the default path to the mounted network namespaces directory
+	NetNsPath = "/var/run/cilium/netns"
+)
+
+var (
+	// BPFEventBufferConfigs contains default configuration entries for bpf map event buffers.
+	// These are to be merged with the client configuration to create the final config.
+	// Note: The TTL corresponds to GC interval times, which is a somewhat expensive operation.
+	// Under the worst case GC may need to memcopy almost the entire buffer, which will
+	// cause memory spikes. Be mindful of this when increasing the default buffer configurations.
+	BPFEventBufferConfigs = map[string]string{
+		"cilium_lxc": "enabled,128,0",
+		// cilium_ipcache is the likely the most useful use of this feature, but also has
+		// the highest churn.
+		"cilium_ipcache":           "enabled,1024,0",
+		"cilium_tunnel_map":        "enabled,128,0",
+		"cilium_lb_affinity_match": "enabled,128,0",
+
+		// ip4
+		"cilium_lb4_services_v2":    "enabled,128,0",
+		"cilium_lb4_backends_v2":    "enabled,128,0",
+		"cilium_lb4_reverse_nat":    "enabled,128,0",
+		"cilium_lb4_backends_v3":    "enabled,128,0",
+		"cilium_lb4_source_range":   "enabled,128,0",
+		"cilium_lb4_affinity_match": "enabled,128,0",
+
+		// ip6
+		"cilium_lb6_services_v2":    "enabled,128,0",
+		"cilium_lb6_backends_v2":    "enabled,128,0",
+		"cilium_lb6_reverse_nat":    "enabled,128,0",
+		"cilium_lb6_backends_v3":    "enabled,128,0",
+		"cilium_lb6_source_range":   "enabled,128,0",
+		"cilium_lb6_affinity_match": "enabled,128,0",
+	}
+
+	PolicyCIDRMatchMode = []string{}
 )

@@ -1,16 +1,5 @@
-// Copyright 2016-2017 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package defaults
 
@@ -27,14 +16,33 @@ const (
 	// DefaultIPv4PrefixLen is the length used to allocate container IPv4 addresses from.
 	DefaultIPv4PrefixLen = 16
 
-	// DefaultNAT46Prefix is the IPv6 prefix to represent NATed IPv4 addresses.
-	DefaultNAT46Prefix = "0:0:0:0:0:FFFF::/96"
-
 	// HostDevice is the name of the device that connects the cilium IP
 	// space with the host's networking model
 	HostDevice = "cilium_host"
+
 	// SecondHostDevice is the name of the second interface of the host veth pair.
 	SecondHostDevice = "cilium_net"
+
+	// IPIPv4Device is a device of type 'ipip', created by the agent.
+	IPIPv4Device = "cilium_ipip4"
+
+	// IPIPv6Device is a device of type 'ip6tnl', created by the agent.
+	IPIPv6Device = "cilium_ipip6"
+
+	// GeneveDevice is a device of type 'geneve', created by the agent.
+	GeneveDevice = "cilium_geneve"
+
+	// VxlanDevice is a device of type 'vxlan', created by the agent.
+	VxlanDevice = "cilium_vxlan"
+
+	// CiliumK8sAnnotationPrefix is the prefix key for the annotations used in kubernetes.
+	CiliumK8sAnnotationPrefix = "cilium.io/"
+
+	// AgentNotReadyNodeTaint is a node taint which prevents pods from being
+	// scheduled. Once cilium is setup it is removed from the node. Mostly
+	// used in cloud providers to prevent existing CNI plugins from managing
+	// pods.
+	AgentNotReadyNodeTaint = "node." + CiliumK8sAnnotationPrefix + "agent-not-ready"
 )
 
 var (
@@ -56,4 +64,13 @@ var (
 
 	// IPv4DefaultRoute is the default IPv4 route.
 	IPv4DefaultRoute = net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+
+	// ExcludedDevicePrefixes are prefixes that we don't consider during automatic device detection.
+	ExcludedDevicePrefixes = []string{
+		"cilium_",
+		"lo",
+		"lxc",
+		"cni",
+		"docker",
+	}
 )

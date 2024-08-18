@@ -1,26 +1,18 @@
-// Copyright 2020 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package bwmap
 
 import (
 	"fmt"
-	"time"
-	"unsafe"
+
+	"github.com/cilium/hive/cell"
 
 	"github.com/cilium/cilium/pkg/bpf"
+	"github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/ebpf"
 	"github.com/cilium/cilium/pkg/maps/lxcmap"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 const (
@@ -39,10 +31,8 @@ type EdtId struct {
 	Id uint64 `align:"id"`
 }
 
-func (k *EdtId) GetKeyPtr() unsafe.Pointer  { return unsafe.Pointer(k) }
-func (k *EdtId) NewValue() bpf.MapValue     { return &EdtInfo{} }
-func (k *EdtId) String() string             { return fmt.Sprintf("%d", int(k.Id)) }
-func (k *EdtId) DeepCopyMapKey() bpf.MapKey { return &EdtId{k.Id} }
+func (k *EdtId) String() string  { return fmt.Sprintf("%d", int(k.Id)) }
+func (k *EdtId) New() bpf.MapKey { return &EdtId{} }
 
 type EdtInfo struct {
 	Bps             uint64    `align:"bps"`
@@ -51,29 +41,38 @@ type EdtInfo struct {
 	Pad             [4]uint64 `align:"pad"`
 }
 
-func (v *EdtInfo) GetValuePtr() unsafe.Pointer { return unsafe.Pointer(v) }
-func (v *EdtInfo) String() string              { return fmt.Sprintf("%d", int(v.Bps)) }
-func (v *EdtInfo) DeepCopyMapValue() bpf.MapValue {
-	return &EdtInfo{v.Bps, v.TimeLast, v.TimeHorizonDrop, v.Pad}
+func (v *EdtInfo) String() string    { return fmt.Sprintf("%d", int(v.Bps)) }
+func (v *EdtInfo) New() bpf.MapValue { return &EdtInfo{} }
+
+type throttleMap struct {
+	*bpf.Map
 }
 
-var ThrottleMap = bpf.NewMap(
-	MapName,
-	bpf.MapTypeHash,
-	&EdtId{}, int(unsafe.Sizeof(EdtId{})),
-	&EdtInfo{}, int(unsafe.Sizeof(EdtInfo{})),
-	MapSize,
-	bpf.BPF_F_NO_PREALLOC, 0,
-	bpf.ConvertKeyValue,
-).WithCache()
-
-func Update(Id uint16, Bps uint64) error {
-	return ThrottleMap.Update(
-		&EdtId{Id: uint64(Id)},
-		&EdtInfo{Bps: Bps, TimeHorizonDrop: uint64(DefaultDropHorizon)})
+// ThrottleMap constructs the cilium_throttle map. Direct use of this
+// outside of this package is solely for cilium-dbg.
+func ThrottleMap() *bpf.Map {
+	return bpf.NewMap(
+		MapName,
+		ebpf.Hash,
+		&EdtId{},
+		&EdtInfo{},
+		MapSize,
+		bpf.BPF_F_NO_PREALLOC,
+	)
 }
 
-func Delete(Id uint16) error {
-	return ThrottleMap.Delete(
-		&EdtId{Id: uint64(Id)})
+func newThrottleMap(cfg types.BandwidthConfig, lc cell.Lifecycle) (out bpf.MapOut[throttleMap]) {
+	m := throttleMap{ThrottleMap()}
+	if cfg.EnableBandwidthManager {
+		// Only open the map if bandwidth manager is enabled.
+		lc.Append(cell.Hook{
+			OnStart: func(cell.HookContext) error {
+				return m.OpenOrCreate()
+			},
+			OnStop: func(cell.HookContext) error {
+				return m.Close()
+			},
+		})
+	}
+	return bpf.NewMapOut(m)
 }

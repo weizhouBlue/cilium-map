@@ -1,27 +1,65 @@
-// Copyright 2019 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package bpf
 
-const (
-	metricOpCreate         = "create"
-	metricOpUpdate         = "update"
-	metricOpLookup         = "lookup"
-	metricOpDelete         = "delete"
-	metricOpGetNextKey     = "getNextKey"
-	metricOpObjPin         = "objPin"
-	metricOpObjGet         = "objGet"
-	metricOpGetFDByID      = "getFDByID"
-	metricOpGetMapInfoByFD = "getMapInfoByFD"
+import (
+	"context"
+
+	"github.com/cilium/hive/job"
+	"github.com/cilium/statedb"
+
+	"github.com/cilium/cilium/pkg/metrics"
+	"github.com/cilium/cilium/pkg/time"
 )
+
+const (
+	metricOpCreate     = "create"
+	metricOpUpdate     = "update"
+	metricOpLookup     = "lookup"
+	metricOpDelete     = "delete"
+	metricOpGetNextKey = "getNextKey"
+)
+
+const (
+	tablePressureMetricsInterval = 30 * time.Second // Interval for updating the pressure gauge
+)
+
+type mapPressureMetricsOps interface {
+	IsOpen() bool
+	NonPrefixedName() string
+	MaxEntries() uint32
+}
+
+// RegisterTablePressureMetricsJob adds a timer job to track the map pressure of a BPF map
+// where the desired state is stored in a StateDB table.
+//
+// Example usage:
+//
+//	type myBPFMap struct { *bpf.Map }
+//	cell.Invoke(
+//	  bpf.RegisterTablePressureMetricsJob[MyObj, myBPFMap],
+//	)
+func RegisterTablePressureMetricsJob[Obj any, Map mapPressureMetricsOps](g job.Group, db *statedb.DB, table statedb.Table[Obj], m Map) {
+	name := m.NonPrefixedName()
+	var pressureGauge *metrics.GaugeWithThreshold
+	g.Add(job.Timer(
+		"pressure-metric-"+name,
+		func(context.Context) error {
+			if !m.IsOpen() {
+				// Map not opened, do nothing.
+				return nil
+			}
+
+			if pressureGauge == nil {
+				pressureGauge = metrics.NewBPFMapPressureGauge(name, 0.0)
+			}
+
+			txn := db.ReadTxn()
+			pressureGauge.Set(float64(table.NumObjects(txn)) / float64(m.MaxEntries()))
+			return nil
+		},
+		tablePressureMetricsInterval,
+	))
+
+}

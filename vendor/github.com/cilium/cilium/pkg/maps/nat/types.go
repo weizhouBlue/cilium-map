@@ -1,27 +1,33 @@
-// Copyright 2019 Authors of Cilium
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of Cilium
 
 package nat
 
 import (
-	"bytes"
+	"strings"
 	"unsafe"
 
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/tuple"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
+
+// IPFamily represents an IP family (i.e., either IPv4 or IPv6).
+type IPFamily bool
+
+const (
+	// IPv4 represents the IPv4 IP family.
+	IPv4 = IPFamily(true)
+	// IPv6 represents the IPv6 IP family.
+	IPv6 = IPFamily(false)
+)
+
+func (family IPFamily) String() string {
+	if family == IPv4 {
+		return "ipv4"
+	}
+	return "ipv6"
+}
 
 type NatKey interface {
 	bpf.MapKey
@@ -32,8 +38,8 @@ type NatKey interface {
 	// ToHost converts fields to host byte order.
 	ToHost() NatKey
 
-	// Dump contents of key to buffer. Returns true if successful.
-	Dump(buffer *bytes.Buffer, reverse bool) bool
+	// Dump contents of key to sb. Returns true if successful.
+	Dump(sb *strings.Builder, reverse bool) bool
 
 	// GetFlags flags containing the direction of the TupleKey.
 	GetFlags() uint8
@@ -43,17 +49,12 @@ type NatKey interface {
 }
 
 // NatKey4 is needed to provide NatEntry type to Lookup values
-// +k8s:deepcopy-gen=true
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapKey
 type NatKey4 struct {
 	tuple.TupleKey4Global
 }
 
 // SizeofNatKey4 is the size of the NatKey4 type in bytes.
 const SizeofNatKey4 = int(unsafe.Sizeof(NatKey4{}))
-
-// NewValue creates a new bpf.MapValue.
-func (k *NatKey4) NewValue() bpf.MapValue { return &NatEntry4{} }
 
 // ToNetwork converts ports to network byte order.
 //
@@ -77,25 +78,19 @@ func (k *NatKey4) ToHost() NatKey {
 	}
 }
 
-// GetKeyPtr returns the unsafe.Pointer for k.
-func (k *NatKey4) GetKeyPtr() unsafe.Pointer { return unsafe.Pointer(k) }
-
 func (k *NatKey4) GetNextHeader() u8proto.U8proto {
 	return k.NextHeader
 }
 
+func (k *NatKey4) New() bpf.MapKey { return &NatKey4{} }
+
 // NatKey6 is needed to provide NatEntry type to Lookup values
-// +k8s:deepcopy-gen=true
-// +k8s:deepcopy-gen:interfaces=github.com/cilium/cilium/pkg/bpf.MapKey
 type NatKey6 struct {
 	tuple.TupleKey6Global
 }
 
 // SizeofNatKey6 is the size of the NatKey6 type in bytes.
 const SizeofNatKey6 = int(unsafe.Sizeof(NatKey6{}))
-
-// NewValue creates a new bpf.MapValue.
-func (k *NatKey6) NewValue() bpf.MapValue { return &NatEntry6{} }
 
 // ToNetwork converts ports to network byte order.
 //
@@ -119,9 +114,8 @@ func (k *NatKey6) ToHost() NatKey {
 	}
 }
 
-// GetKeyPtr returns the unsafe.Pointer for k.
-func (k *NatKey6) GetKeyPtr() unsafe.Pointer { return unsafe.Pointer(k) }
-
 func (k *NatKey6) GetNextHeader() u8proto.U8proto {
 	return k.NextHeader
 }
+
+func (k *NatKey6) New() bpf.MapKey { return &NatKey6{} }
